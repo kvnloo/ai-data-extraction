@@ -45,6 +45,11 @@ def find_claude_installations():
         '.claude', '.claude-code', '.claude-local', '.claude-m2', '.claude-zai'
     ]
 
+    # An explicitly configured directory is where the sessions actually are
+    configured = os.environ.get('CLAUDE_CONFIG_DIR')
+    if configured and Path(configured).exists():
+        locations.append(Path(configured))
+
     for base_dir in base_dirs:
         if not base_dir.exists():
             continue
@@ -55,13 +60,23 @@ def find_claude_installations():
             if claude_dir.exists():
                 locations.append(claude_dir)
 
-        # Also check home directory directly
-        for pattern in claude_patterns:
-            home_dir = home / pattern
-            if home_dir.exists():
-                locations.append(home_dir)
+    # Also check home directory directly, whether or not the directories above exist
+    for pattern in claude_patterns:
+        home_dir = home / pattern
+        if home_dir.exists():
+            locations.append(home_dir)
 
-    return list(set(locations))  # Remove duplicates
+    return list(dict.fromkeys(locations))  # Remove duplicates, keep discovery order
+
+
+def _block_text(content):
+    """Text of a tool result, which is either a string or a list of text blocks"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(item if isinstance(item, str) else item.get('text', '') for item in content
+                         if isinstance(item, str) or (isinstance(item, dict) and item.get('type') == 'text'))
+    return ''
 
 def extract_claude_project_conversations(project_dir):
     """Extract conversations from a Claude project directory with full context"""
@@ -101,6 +116,20 @@ def extract_claude_project_conversations(project_dir):
                             message = obj.get('message', {})
                             content = message.get('content', '')
 
+                            # Tool output is stored as a user entry; it is not something the user said
+                            if isinstance(content, list):
+                                for item in content:
+                                    if isinstance(item, dict) and item.get('type') == 'tool_result':
+                                        messages.append({
+                                            'role': 'tool',
+                                            'tool_call_id': item.get('tool_use_id'),
+                                            'content': _block_text(item.get('content')),
+                                            'is_error': bool(item.get('is_error')),
+                                            'timestamp': obj.get('timestamp')
+                                        })
+                                content = [item for item in content
+                                           if not (isinstance(item, dict) and item.get('type') == 'tool_result')]
+
                             if content:
                                 msg = {
                                     'role': 'user',
@@ -126,12 +155,15 @@ def extract_claude_project_conversations(project_dir):
                             text_parts = []
                             code_blocks = []
                             tool_uses = []
+                            thinking = []
 
                             if isinstance(content, list):
                                 for item in content:
                                     if isinstance(item, dict):
                                         if item.get('type') == 'text':
                                             text_parts.append(item.get('text', ''))
+                                        elif item.get('type') == 'thinking' and item.get('thinking'):
+                                            thinking.append(item['thinking'])
                                         elif item.get('type') == 'tool_use':
                                             # Code execution, file edits, etc.
                                             tool_uses.append(item)
@@ -147,10 +179,26 @@ def extract_claude_project_conversations(project_dir):
                                     'timestamp': obj.get('timestamp')
                                 }
 
+                                if thinking:
+                                    msg['reasoning'] = '\n'.join(thinking)
+
                                 if tool_uses:
                                     msg['tool_uses'] = tool_uses
 
                                 messages.append(msg)
+
+                        elif msg_type == 'attachment':
+                            # Context a hook added is something the model read but the user never typed
+                            attachment = obj.get('attachment') or {}
+                            if attachment.get('type') == 'hook_additional_context':
+                                messages.append({
+                                    'role': 'system',
+                                    'content': _block_text(attachment.get('content')),
+                                    'timestamp': obj.get('timestamp'),
+                                    'custom': True,
+                                    'custom_type': 'hook_additional_context',
+                                    'hook_event': attachment.get('hookEvent')
+                                })
 
                         elif msg_type == 'tool_result':
                             # Capture tool results (diffs, file reads, etc.)
