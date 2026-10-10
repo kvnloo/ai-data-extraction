@@ -5,6 +5,7 @@ import os
 import random
 import shutil
 import tempfile
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -2185,6 +2186,7 @@ GROWTH_LIMIT = 20_000     # bytes the added fields may add to one message
 UNSERIALISABLE = {"omitted": True, "kind": "unserialisable"}
 STRING_LIMIT = extract_claude_code.STRUCTURED_STRING_LIMIT
 LIST_LIMIT = extract_claude_code.STRUCTURED_LIST_LIMIT
+LINKING_SECONDS = 8       # bound on one export of 60,000 entries; it takes under 1 s, and took over 30 s
 
 
 def call(uuid="s1", tool_id="toolu_1", parent="u1", name="Bash", **message):
@@ -2305,6 +2307,41 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
 
     def structured(self, tool_use_result):
         return self.tools(call(), result(toolUseResult=tool_use_result))[0]["structured"]
+
+    def test_finding_the_calling_entry_costs_time_in_proportion_to_the_messages(self):
+        # 60,000 entries that all make the call toolu_1: seconds, not minutes, whether or not a result
+        # has to be linked. Comparing each entry with every one before it took over 30 s here.
+        calls = [call(f"s{n}", parent=f"s{n - 1}" if n else "u1") for n in range(60000)]
+        for needs_lookup, fields in ((True, {"toolUseResult": {"stdout": "ok"}}), (False, {})):
+            with self.subTest(needs_lookup=needs_lookup):
+                started = time.perf_counter()
+                tool = self.tools(*calls, result(parent="s59999", **fields))[0]
+                self.assertLess(time.perf_counter() - started, LINKING_SECONDS)
+                self.assertNotIn("source_assistant_id", tool)
+
+    def test_an_entry_is_compared_with_at_most_two_others_that_made_the_same_call(self):
+        class Entry:
+            compared = 0
+
+            def __eq__(self, other):
+                Entry.compared += 1
+                return self is other
+
+        messages = [{"id": Entry(), "tool_uses": [{"id": "toolu_1"}]} for _ in range(2000)]
+        tool = {"tool_call_id": "toolu_1"}
+        extract_claude_code._link_calling_entries([tool], messages)
+        self.assertLessEqual(Entry.compared, 2 * len(messages))
+        self.assertEqual(tool, {"tool_call_id": "toolu_1"})
+
+    def test_the_messages_are_not_read_when_no_result_needs_its_calling_entry(self):
+        class Unread:
+            def __iter__(self):
+                raise AssertionError("the messages were read")
+
+        extract_claude_code._link_calling_entries([], Unread())
+        # ... and they are read as soon as one does
+        with self.assertRaises(AssertionError):
+            extract_claude_code._link_calling_entries([{"tool_call_id": "toolu_1"}], Unread())
 
     def test_a_tool_message_carries_the_structured_result_and_the_entry_that_made_the_call(self):
         shell = {"stdout": "", "stderr": "make: *** [build] Error 2", "interrupted": False, "returnCode": 2,

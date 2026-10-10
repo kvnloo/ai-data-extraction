@@ -268,13 +268,15 @@ def _link_calling_entries(unlinked, messages):
 
     Nothing is written when no exported assistant message has a tool_use with that id, when
     more than one has, or when the one that has carries no entry id that _id accepts.
+    The messages are read only when there is such a tool message, and no more than two
+    callers of one id are kept: two already say it has more than one.
     """
     callers = {}
-    for message in messages:
+    for message in messages if unlinked else ():
         for tool_use in message.get('tool_uses', ()):  # only an assistant message has them
             if isinstance(tool_use.get('id'), str):
                 made_by = callers.setdefault(tool_use['id'], [])
-                if message['id'] not in made_by:
+                if len(made_by) < 2 and message['id'] not in made_by:
                     made_by.append(message['id'])
     for tool_msg in unlinked:
         made_by = callers.get(tool_msg['tool_call_id'], ()) if isinstance(tool_msg['tool_call_id'], str) else ()
