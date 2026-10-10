@@ -360,7 +360,7 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
                 entry_ids = tuple(message.get('id') for message in conversation['messages'])
                 # Without real entry ids two transcripts cannot be told apart, so both are kept
                 identified = bool(entry_ids) and all(isinstance(i, str) and i for i in entry_ids)
-                first = exported.get((parent_session, agent, entry_ids)) if identified else None
+                first = exported.get((parent_session, agent, entry_ids))
                 if first is not None:
                     first.setdefault('duplicate_source_files', []).append(conversation['source_file'])
                     continue
