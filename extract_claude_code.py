@@ -346,14 +346,26 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
                 sessions[conversation['session_id']] = conversation
 
         agents_of = {}
+        exported = {}
         for agent_file, parent_session in subagent_files:
             agent = agent_file.stem[len('agent-'):]
             conversation, entry_session_id = convert(agent_file, project_name)
             # Only a string can name a session; anything else in that field is noise
-            parent_session = parent_session or (entry_session_id if isinstance(entry_session_id, str) else None)
+            if not parent_session and isinstance(entry_session_id, str):
+                parent_session = entry_session_id.strip() or None
             if parent_session:
                 agents_of.setdefault(parent_session, []).append(agent)
             if conversation:
+                # The same transcript can sit in both layouts; exported twice, its usage counts twice
+                entry_ids = tuple(message.get('id') for message in conversation['messages'])
+                # Without real entry ids two transcripts cannot be told apart, so both are kept
+                identified = bool(entry_ids) and all(isinstance(i, str) and i for i in entry_ids)
+                first = exported.get((parent_session, agent, entry_ids)) if identified else None
+                if first is not None:
+                    first.setdefault('duplicate_source_files', []).append(conversation['source_file'])
+                    continue
+                if identified:
+                    exported[(parent_session, agent, entry_ids)] = conversation
                 conversation.update(subagent=True, agent=agent, parent_session=parent_session,
                                     **_agent_meta(agent_file))
                 subagent_conversations.append(conversation)

@@ -500,3 +500,62 @@ class ExtractClaudeCodeSubagentTests(unittest.TestCase):
         main, _ = self.export()
 
         self.assertEqual(main[0]["subagent_sessions"], ["dup"])
+
+    def test_the_same_transcript_in_both_layouts_is_exported_once(self):
+        self.parent()
+        self.nested("dup")
+        self.beside("dup")
+
+        main, subs = self.export()
+
+        self.assertEqual([c["agent"] for c in subs], ["dup"])
+        self.assertEqual(len(subs[0]["duplicate_source_files"]), 1)
+        # Summed the naive way, one conversation at a time, usage is counted once
+        naive = sum(m["usage"]["output_tokens"] for c in main + subs for m in c["messages"] if m.get("usage"))
+        expected = sum(m["usage"]["output_tokens"] for c in main + subs[:1] for m in c["messages"] if m.get("usage"))
+        self.assertEqual(naive, expected)
+
+    def test_two_different_transcripts_with_one_agent_id_are_both_kept(self):
+        self.parent()
+        self.nested("same")
+        rows = transcript("same", SUB_USAGE, "sess-1", "same")
+        for row in rows:
+            row["uuid"] = "other-" + row["uuid"]
+            if row.get("parentUuid"):
+                row["parentUuid"] = "other-" + row["parentUuid"]
+        write_rows(self.project / "agent-same.jsonl", rows)
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 2)
+        self.assertTrue(all("duplicate_source_files" not in c for c in subs))
+
+    def test_a_padded_session_id_still_links_to_its_session(self):
+        self.parent()
+        rows = transcript("pad", SUB_USAGE, "sess-1", "pad")
+        for row in rows:
+            row["sessionId"] = " sess-1 "
+        write_rows(self.project / "agent-pad.jsonl", rows)
+        blank = transcript("blank", SUB_USAGE, "sess-1", "blank")
+        for row in blank:
+            row["sessionId"] = " \t"
+        write_rows(self.project / "agent-blank.jsonl", blank)
+
+        main, subs = self.export()
+
+        by_agent = {c["agent"]: c["parent_session"] for c in subs}
+        self.assertEqual(by_agent, {"pad": "sess-1", "blank": None})
+        self.assertEqual(main[0]["subagent_sessions"], ["pad"])
+
+    def test_transcripts_without_entry_ids_are_never_merged(self):
+        self.parent()
+        for where in (self.project / "sess-1" / "subagents" / "agent-anon.jsonl", self.project / "agent-anon.jsonl"):
+            rows = transcript("anon", SUB_USAGE, "sess-1", "anon")
+            for row in rows:
+                row.pop("uuid", None)
+                row.pop("parentUuid", None)
+            write_rows(where, rows)
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 2)
