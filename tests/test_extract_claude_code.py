@@ -813,3 +813,301 @@ class ExtractClaudeCodeWholeExportTests(unittest.TestCase):
         for agent_id in ("a-deep", "z-deep"):
             self.assertIn(f"agent-{agent_id}.jsonl", printed)
 
+
+
+BAD = b"\xff"  # a byte that is not text in any UTF-8 name
+
+
+def name_bytes(value):
+    """The bytes behind a name the export wrote in its escaped form"""
+    from urllib.parse import unquote_to_bytes
+    if not value.startswith("bytes://"):
+        raise AssertionError(f"not an escaped name: {value!r}")
+    return unquote_to_bytes(value[len("bytes://"):])
+
+
+class ExtractClaudeCodeNamesThatAreNotTextTests(unittest.TestCase):
+    """The script itself, run over a synthetic home whose files have names that are not valid UTF-8
+
+    Paths are built as bytes so the fixture is the same whatever locale the tests run under.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.fsencode(tmp.name)
+        self.home = self.root + b"/home"
+        self.project = self.home + b"/.claude/projects/-work"
+        self.out = self.root + b"/out"
+        os.makedirs(self.out)
+        self.put(self.project + b"/sess-1.jsonl", transcript("main", PARENT_USAGE, "sess-1"))
+
+    def put(self, path, rows=(), raw=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw if raw is not None else "".join(json.dumps(r) + "\n" for r in rows).encode())
+        return path
+
+    def sub(self, name, session=b"sess-1", rows=None, agent_id="named"):
+        path = self.project + b"/" + session + b"/subagents/" + name
+        return self.put(path, transcript(agent_id, SUB_USAGE, "sess-1", agent_id) if rows is None else rows)
+
+    def export(self, stdout="utf-8:strict", home=None, expect=0, **env):
+        """Run the export as a program; returns (lines of the output file as bytes, what it printed)"""
+        import subprocess
+        import sys
+
+        script = Path(extract_claude_code.__file__).resolve()
+        environ = {b"HOME": home or self.home, b"PYTHONUTF8": b"1", b"PYTHONIOENCODING": os.fsencode(stdout)}
+        environ.update({os.fsencode(k): os.fsencode(v) for k, v in env.items()})
+        for old in Path(os.fsdecode(self.out)).glob("extracted_data/*.jsonl"):
+            old.unlink()
+        # Nothing of the caller's environment reaches the run: no configured directory, no real home
+        done = subprocess.run([sys.executable, "-s", "-B", str(script)], cwd=self.out, env=environ,
+                              capture_output=True)
+        self.assertEqual(done.returncode, expect, done.stderr.decode(errors="replace"))
+        files = list(Path(os.fsdecode(self.out)).glob("extracted_data/*.jsonl"))
+        lines = files[0].read_bytes().splitlines(keepends=True) if files else []
+        return lines, done.stdout
+
+    def conversations(self, lines):
+        for line in lines:
+            self.assertTrue(line.endswith(b"\n"))
+        return [json.loads(line.decode("utf-8")) for line in lines]
+
+    def test_an_empty_sub_agent_file_with_a_name_that_is_not_text_leaves_the_session_as_it_was(self):
+        before, _ = self.export()
+        self.sub(b"agent-" + BAD + b".jsonl", rows=[])
+        lines, _ = self.export()
+        self.assertEqual(len(lines), 1)
+        parent = json.loads(lines[0].decode("utf-8"))
+        self.assertEqual(parent.pop("subagent_sessions"), ["bytes://%FF"])
+        self.assertEqual((json.dumps(parent, ensure_ascii=False) + "\n").encode("utf-8"), before[0])
+
+    def test_a_sub_agent_named_with_bytes_is_listed_and_exported_under_one_escaped_name(self):
+        path = self.sub(b"agent-" + BAD + b".jsonl")
+        parent, agent = self.conversations(self.export()[0])
+        self.assertEqual(parent["subagent_sessions"], ["bytes://%FF"])
+        self.assertEqual(agent["agent"], "bytes://%FF")
+        self.assertEqual(agent["parent_session"], parent["session_id"])
+        self.assertEqual(agent["session_id"], "bytes://agent-%FF")
+        self.assertEqual(name_bytes(agent["agent"]), BAD)
+        self.assertEqual(name_bytes(agent["source_file"]), path)
+        # A path keeps its separators, so it still reads as one
+        self.assertTrue(agent["source_file"].startswith("bytes:///"))
+        self.assertTrue(agent["source_file"].endswith("/sess-1/subagents/agent-%FF.jsonl"))
+        self.assertEqual(len(agent["messages"]), 2)
+
+    def test_only_the_name_is_escaped_not_the_rest_of_the_line(self):
+        rows = transcript("named", SUB_USAGE, "sess-1", "named")
+        rows[0]["message"]["content"] = "caf\u00e9 \u2603"
+        self.sub(b"agent-" + BAD + b".jsonl", rows=rows)
+        lines, _ = self.export()
+        self.assertIn("caf\u00e9 \u2603".encode("utf-8"), lines[1])
+        self.assertNotIn(b"\\udc", lines[1])
+
+    def test_a_sub_agent_named_with_bytes_beside_the_session_files_is_listed_too(self):
+        path = self.put(self.project + b"/agent-" + BAD + b".jsonl", transcript("named", SUB_USAGE, "sess-1", "named"))
+        parent, agent = self.conversations(self.export()[0])
+        self.assertEqual(parent["subagent_sessions"], [agent["agent"]])
+        self.assertEqual(name_bytes(agent["source_file"]), path)
+
+    def test_an_escaped_name_is_never_the_same_as_a_real_one(self):
+        self.sub(b"agent-" + BAD + b".jsonl", agent_id="one")
+        self.sub(b"agent-%FF.jsonl", agent_id="two")
+        self.sub(b"agent-bytes:%FF.jsonl", agent_id="three")
+        parent, *agents = self.conversations(self.export()[0])
+        self.assertEqual(parent["subagent_sessions"], ["%FF", "bytes:%FF", "bytes://%FF"])
+        self.assertEqual(sorted(a["agent"] for a in agents), parent["subagent_sessions"])
+
+    def test_a_name_that_is_text_is_written_as_it_is(self):
+        path = self.sub("agent-caf\u00e9 50%.jsonl".encode("utf-8"))
+        parent, agent = self.conversations(self.export()[0])
+        self.assertEqual(parent["subagent_sessions"], ["caf\u00e9 50%"])
+        self.assertEqual(agent["agent"], "caf\u00e9 50%")
+        self.assertEqual(agent["source_file"].encode("utf-8"), path)
+
+    def test_percent_and_other_bytes_in_an_escaped_name_come_back_exactly(self):
+        name = b"agent-50%41 caf\xc3\xa9 " + BAD + b"\x80.jsonl"
+        path = self.sub(name)
+        parent, agent = self.conversations(self.export()[0])
+        self.assertEqual(name_bytes(agent["agent"]), name[len(b"agent-"):-len(b".jsonl")])
+        self.assertEqual(name_bytes(agent["source_file"]), path)
+        self.assertEqual(parent["subagent_sessions"], [agent["agent"]])
+
+    def test_a_directory_named_with_bytes_under_subagents_does_not_stop_the_export(self):
+        path = self.sub(b"deep-" + BAD + b"/agent-inner.jsonl")
+        self.put(path[:-len(b".jsonl")] + b".meta.json", raw=json.dumps({"agentType": "Explore"}).encode())
+        parent, agent = self.conversations(self.export()[0])
+        self.assertEqual(parent["subagent_sessions"], ["inner"])
+        self.assertEqual(agent["agent"], "inner")
+        self.assertEqual(agent["agent_type"], "Explore")
+        self.assertEqual(name_bytes(agent["source_file"]), path)
+
+    def test_both_copies_of_a_sub_agent_named_with_bytes_are_named_in_the_one_conversation(self):
+        nested = self.sub(b"agent-" + BAD + b".jsonl")
+        beside = self.put(self.project + b"/agent-" + BAD + b".jsonl", transcript("named", SUB_USAGE, "sess-1", "named"))
+        parent, agent = self.conversations(self.export()[0])
+        self.assertEqual(parent["subagent_sessions"], ["bytes://%FF"])
+        self.assertEqual({name_bytes(agent["source_file"])} | {name_bytes(f) for f in agent["duplicate_source_files"]},
+                         {nested, beside})
+
+    def test_an_unreadable_file_named_with_bytes_is_reported_and_costs_only_itself(self):
+        self.put(self.project + b"/sess-1/subagents/agent-" + BAD + b".jsonl", raw=b'{"type": "user"}\n\xff\xfe\n')
+        self.sub(b"agent-z.jsonl", agent_id="z")
+        for stdout in ("utf-8:strict", "utf-8:surrogateescape"):
+            lines, printed = self.export(stdout=stdout)
+            parent, agent = self.conversations(lines)
+            self.assertEqual(parent["subagent_sessions"], ["bytes://%FF", "z"])
+            self.assertEqual(agent["agent"], "z")
+            self.assertIn(b"Error processing", printed)
+            self.assertIn(b"agent-", printed)
+
+    def test_an_unreadable_session_file_named_with_bytes_is_reported_and_costs_only_itself(self):
+        self.put(self.project + b"/sess-" + BAD + b".jsonl", raw=b"\xff\xfe\n")
+        lines, printed = self.export()
+        self.assertEqual([c["session_id"] for c in self.conversations(lines)], ["sess-1"])
+        self.assertIn(b"Error processing", printed)
+
+    def test_a_sub_agent_too_deep_to_write_under_a_directory_named_with_bytes_is_reported(self):
+        levels = depth_that_parses_but_cannot_be_written()
+        if levels is None:
+            self.skipTest("this interpreter refuses to read any nesting it cannot write")
+        row = json.dumps({"type": "assistant", "uuid": "deep-s0", "parentUuid": None, "timestamp": TS,
+                          "sessionId": "sess-1", "agentId": "deep",
+                          "message": {"role": "assistant", "model": "claude-x", "content": [
+                              {"type": "tool_use", "id": "toolu_d", "name": "Bash", "input": "DEEP"}]}})
+        self.put(self.project + b"/sess-1/subagents/d-" + BAD + b"/agent-a-deep.jsonl",
+                 raw=row.replace('"DEEP"', deep(levels)).encode() + b"\n")
+        self.sub(b"agent-z.jsonl", agent_id="z")
+        lines, printed = self.export()
+        parent, agent = self.conversations(lines)
+        self.assertEqual(parent["subagent_sessions"], ["a-deep", "z"])
+        self.assertEqual(agent["agent"], "z")
+        self.assertIn(b"agent-a-deep.jsonl", printed)
+
+    def test_a_session_file_named_with_bytes_is_exported_and_its_sub_agents_still_join_it(self):
+        path = self.put(self.project + b"/sess-" + BAD + b".jsonl", transcript("other", PARENT_USAGE, "sess-other"))
+        self.sub(b"agent-a.jsonl", session=b"sess-" + BAD, agent_id="a")
+        by_id = {c["session_id"]: c for c in self.conversations(self.export()[0])}
+        self.assertEqual(sorted(by_id), ["agent-a", "bytes://sess-%FF", "sess-1"])
+        session = by_id["bytes://sess-%FF"]
+        self.assertEqual(name_bytes(session["source_file"]), path)
+        self.assertEqual(session["subagent_sessions"], ["a"])
+        self.assertEqual(by_id["agent-a"]["parent_session"], "bytes://sess-%FF")
+        self.assertNotIn("subagent_sessions", by_id["sess-1"])
+
+    def test_a_session_id_in_the_entries_that_is_not_text_is_escaped_like_the_name_it_matches(self):
+        self.put(self.project + b"/sess-" + BAD + b".jsonl", transcript("other", PARENT_USAGE, "sess-other"))
+        self.put(self.project + b"/agent-a.jsonl", transcript("a", SUB_USAGE, " sess-\udcff ", "a"))
+        self.put(self.project + b"/agent-b.jsonl", transcript("b", SUB_USAGE, "lone \ud800", "b"))
+        lines, _ = self.export()
+        by_id = {c["session_id"]: c for c in self.conversations(lines)}
+        self.assertEqual(by_id["bytes://sess-%FF"]["subagent_sessions"], ["a"])
+        self.assertEqual(by_id["agent-a"]["parent_session"], "bytes://sess-%FF")
+        self.assertEqual(by_id["agent-b"]["parent_session"], "bytes://lone%20%ED%A0%80")
+        self.assertNotIn(b"\\ud", b"".join(lines))
+
+    def test_a_project_directory_named_with_bytes_is_exported(self):
+        project = self.home + b"/.claude/projects/proj-" + BAD
+        path = self.put(project + b"/sess-2.jsonl", transcript("two", PARENT_USAGE, "sess-2"))
+        self.put(project + b"/sess-2/subagents/agent-a.jsonl", transcript("a", SUB_USAGE, "sess-2", "a"))
+        by_id = {c["session_id"]: c for c in self.conversations(self.export()[0])}
+        self.assertEqual(sorted(by_id), ["agent-a", "sess-1", "sess-2"])
+        self.assertEqual(by_id["sess-2"]["project_name"], "bytes://proj-%FF")
+        self.assertEqual(by_id["agent-a"]["project_name"], "bytes://proj-%FF")
+        self.assertEqual(name_bytes(by_id["sess-2"]["source_file"]), path)
+        self.assertEqual(by_id["sess-1"]["project_name"], "-work")
+
+    def test_a_home_directory_named_with_bytes_is_exported_and_printed(self):
+        home = self.root + b"/home-" + BAD
+        path = self.put(home + b"/.claude/projects/-work/sess-3.jsonl", transcript("three", PARENT_USAGE, "sess-3"))
+        for stdout in ("utf-8:strict", "utf-8:surrogateescape"):
+            lines, printed = self.export(stdout=stdout, home=home)
+            (session,) = self.conversations(lines)
+            self.assertEqual(name_bytes(session["installation"]), home + b"/.claude")
+            self.assertEqual(name_bytes(session["source_file"]), path)
+            self.assertEqual(printed.count(b"home-"), 2)
+
+    def test_a_configured_directory_named_with_bytes_is_exported_and_printed(self):
+        configured = self.root + b"/cfg-" + BAD
+        self.put(configured + b"/projects/-work/sess-4.jsonl", transcript("four", PARENT_USAGE, "sess-4"))
+        lines, printed = self.export(CLAUDE_CONFIG_DIR=os.fsdecode(configured))
+        by_id = {c["session_id"]: c for c in self.conversations(lines)}
+        self.assertEqual(sorted(by_id), ["sess-1", "sess-4"])
+        self.assertEqual(name_bytes(by_id["sess-4"]["installation"]), configured)
+        # Found, processed, and counted in the breakdown
+        self.assertEqual(printed.count(b"cfg-"), 3)
+
+    def test_names_are_escaped_when_the_locale_cannot_read_them_as_text(self):
+        # Without a UTF-8 locale every byte above 127 in a name is one the output file cannot hold
+        path = self.sub("agent-caf\u00e9.jsonl".encode("utf-8"))
+        lines, _ = self.export(stdout="utf-8:strict", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0", LC_ALL="C")
+        parent, agent = self.conversations(lines)
+        self.assertEqual(parent["subagent_sessions"], ["bytes://caf%C3%A9"])
+        self.assertEqual(agent["agent"], "bytes://caf%C3%A9")
+        self.assertEqual(name_bytes(agent["source_file"]), path)
+
+
+class SayTests(unittest.TestCase):
+    """A printed line is shown escaped when the terminal cannot show it, never raised"""
+
+    def said(self, text, encoding, errors="strict"):
+        import contextlib
+        import io
+
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding=encoding, errors=errors)
+        with contextlib.redirect_stdout(stream):
+            extract_claude_code._say(text)
+        stream.flush()
+        return raw.getvalue()
+
+    def test_text_the_terminal_can_show_is_printed_as_it_is(self):
+        self.assertEqual(self.said("caf\u00e9", "utf-8"), "caf\u00e9\n".encode("utf-8"))
+
+    def test_a_name_that_is_not_text_is_printed_escaped(self):
+        self.assertEqual(self.said("x \udcff y", "utf-8"), b"x \\udcff y\n")
+
+    def test_what_an_ascii_terminal_cannot_show_is_printed_escaped(self):
+        self.assertEqual(self.said("\u26a0 caf\u00e9 \udcff", "ascii"), b"\\u26a0 caf\\xe9 \\udcff\n")
+
+    def test_a_terminal_that_passes_bytes_through_gets_the_name_itself(self):
+        self.assertEqual(self.said("x \udcff", "utf-8", "surrogateescape"), b"x \xff\n")
+
+    def test_output_that_names_no_encoding_gets_plain_ascii(self):
+        import contextlib
+
+        class Plain:
+            """Something to print to that takes ASCII only and does not say so"""
+            def __init__(self):
+                self.text = ""
+
+            def write(self, text):
+                text.encode("ascii")
+                self.text += text
+
+            def flush(self):
+                pass
+
+        stream = Plain()
+        with contextlib.redirect_stdout(stream):
+            extract_claude_code._say("caf\u00e9 \udcff")
+        self.assertEqual(stream.text, "caf\\xe9 \\udcff\n")
+
+    def test_an_error_while_reading_a_file_is_reported_on_an_ascii_terminal(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = os.fsencode(tmp) + b"/projects/-work"
+            # A directory where a transcript should be cannot be read, whatever the locale
+            os.makedirs(project + b"/sess-" + BAD + b".jsonl")
+            raw = io.BytesIO()
+            stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+            with contextlib.redirect_stdout(stream):
+                found = extract_claude_project_conversations(os.fsdecode(os.fsencode(tmp)))
+            stream.flush()
+        self.assertEqual(found, [])
+        self.assertIn(b"Error processing", raw.getvalue())
+        self.assertIn(b"sess-\\udcff.jsonl", raw.getvalue())

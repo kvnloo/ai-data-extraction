@@ -3,6 +3,7 @@
 Extract ALL Claude Code chat data from all projects
 Includes: messages, code context, diffs, file references
 Sub-agent transcripts are exported as conversations of their own
+A file or directory name that is not valid text is written as bytes://<percent-encoded bytes>
 Auto-discovers Claude Code installations on the device
 """
 
@@ -13,6 +14,8 @@ from datetime import datetime
 import hashlib
 import platform
 import os
+import sys
+from urllib.parse import quote
 
 def find_claude_installations():
     """Find all Claude Code installation directories"""
@@ -68,6 +71,45 @@ def find_claude_installations():
             locations.append(home_dir)
 
     return list(dict.fromkeys(locations))  # Remove duplicates, keep discovery order
+
+
+ESCAPED_NAME = 'bytes://'
+
+
+def _name(text):
+    """A file or directory name, or a path, as text every output can hold
+
+    A name is bytes and not every name is text. One that is valid text is returned unchanged.
+    One that is not is returned as 'bytes://' followed by its bytes percent-encoded ('/' is
+    kept, '%' becomes '%25'): agent-<byte FF>.jsonl gives the agent id 'bytes://%FF'.
+    urllib.parse.unquote_to_bytes(value[len('bytes://'):]) gives the bytes back.
+
+    No name returned unchanged holds '://' (a file name has no '/', and a path never repeats
+    one after its start), so an escaped name is never mistaken for a real one, and the same
+    name is escaped the same way wherever it is written.
+
+    The session id a transcript's entries give is written the same way, so that it still
+    equals the id of the session it names; one that is not text and not a name either is
+    escaped from its UTF-8 form with the unpaired surrogates kept.
+    """
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        try:
+            raw = os.fsencode(text)
+        except UnicodeEncodeError:
+            raw = text.encode('utf-8', 'surrogatepass')
+        return ESCAPED_NAME + quote(raw)
+    return text
+
+
+def _say(text):
+    """Print a line that can hold a path; what the terminal cannot show is escaped, not raised"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        print(text.encode(encoding, 'backslashreplace').decode(encoding))
 
 
 ENTRY_FLAGS = {'isSidechain': 'is_sidechain', 'isMeta': 'is_meta', 'isCompactSummary': 'is_compact_summary'}
@@ -135,7 +177,7 @@ def _session_files(container):
     # Sessions keep the order the directory lists them in, as they always have
     sessions = [f for f in container.glob('*.jsonl') if not f.name.startswith('agent-')]
     subagents = [(f, None) for f in sorted(container.glob('agent-*.jsonl'))]
-    subagents += [(f, f.relative_to(container).parts[0])
+    subagents += [(f, _name(f.relative_to(container).parts[0]))
                   for f in sorted(container.glob('*/subagents/**/agent-*.jsonl'))]
     return sessions, [(f, parent) for f, parent in subagents if f.is_file()]
 
@@ -149,7 +191,7 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
     omitted_attachments = {}
     omitted_entries = {}
     skipped_lines = 0
-    session_id = jsonl_file.stem
+    session_id = _name(jsonl_file.stem)
     project_path = None
     entry_session_id = None
 
@@ -310,8 +352,8 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
         'omitted_attachments': omitted_attachments,
         'omitted_entries': omitted_entries,
         'skipped_lines': skipped_lines,
-        'source_file': str(jsonl_file),
-        'installation': str(project_dir)
+        'source_file': _name(str(jsonl_file)),
+        'installation': _name(str(project_dir))
     }, entry_session_id
 
 
@@ -321,6 +363,10 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
     A sub-agent's transcript is exported as a conversation of its own, marked 'subagent' and
     linked to its session by 'parent_session'; the session lists its sub-agents in
     'subagent_sessions' whether or not they are exported.
+
+    Every name taken from a file or directory ('session_id', 'agent', 'parent_session',
+    'subagent_sessions', 'project_name', 'source_file', 'duplicate_source_files',
+    'installation') is written by _name: unchanged when it is text, escaped when it is not.
     """
     project_dir = Path(project_dir)
     conversations = []
@@ -337,11 +383,11 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
         try:
             return _convert_session_file(jsonl_file, project_dir, project_name)
         except Exception as e:
-            print(f"Error processing {jsonl_file}: {e}")
+            _say(f"Error processing {jsonl_file}: {e}")
             return None, None
 
     for container in containers:
-        project_name = container.name if container.name != 'projects' else None
+        project_name = _name(container.name) if container.name != 'projects' else None
         session_files, subagent_files = _session_files(container)
 
         sessions = {}
@@ -354,11 +400,11 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
         agents_of = {}
         exported = {}
         for agent_file, parent_session in subagent_files:
-            agent = agent_file.stem[len('agent-'):]
+            agent = _name(agent_file.stem[len('agent-'):])
             conversation, entry_session_id = convert(agent_file, project_name)
             # Only a string can name a session; anything else in that field is noise
             if not parent_session and isinstance(entry_session_id, str):
-                parent_session = entry_session_id.strip() or None
+                parent_session = _name(entry_session_id.strip()) or None
             if parent_session:
                 agents_of.setdefault(parent_session, []).append(agent)
             if conversation:
@@ -400,7 +446,8 @@ def _output_line(conversation, encoding):
     A session is written as it always was, and a failure there still stops the export. A
     sub-agent conversation must never do that, because the sessions around it were exported
     before sub-agents were: what the file's encoding cannot hold is escaped, and what is
-    nested too deeply to serialise is left out.
+    nested too deeply to serialise is left out. Names are not what fails here: _name has
+    already made every one of them text, in a session and in a sub-agent alike.
     """
     if not conversation.get('subagent'):
         return json.dumps(conversation, ensure_ascii=False) + '\n'
@@ -430,7 +477,7 @@ def main():
 
     print(f"✅ Found {len(installations)} installation(s):")
     for inst in installations:
-        print(f"   - {inst}")
+        _say(f"   - {inst}")
     print()
 
     # Extract from all installations
@@ -438,7 +485,7 @@ def main():
     installation_stats = {}
 
     for installation in installations:
-        print(f"📂 Processing: {installation}")
+        _say(f"📂 Processing: {installation}")
 
         conversations = extract_claude_project_conversations(installation)
 
@@ -476,7 +523,7 @@ def main():
 
     print("Breakdown by installation:")
     for inst, count in sorted(installation_stats.items(), key=lambda x: -x[1]):
-        print(f"  {Path(inst).name:20} {count:5,} conversations")
+        _say(f"  {Path(inst).name:20} {count:5,} conversations")
     print()
 
     # Save to organized JSONL
@@ -492,6 +539,7 @@ def main():
             line = _output_line(conv, f.encoding)
             if line is None:
                 not_written += 1
+                # source_file is text by now, whatever the file is called
                 print(f"⚠️  Not written, nested too deeply to serialise: {conv['source_file']}")
                 continue
             f.write(line)
