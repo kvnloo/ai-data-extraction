@@ -101,6 +101,11 @@ def _omitted_blocks(content):
                            'encoded_size': len(source.get('data') or '')})
     return blocks
 
+def _messages_digest(messages):
+    """One value for everything a conversation's messages say, so two copies can be compared"""
+    return hashlib.sha256(json.dumps(messages, sort_keys=True, default=str).encode()).hexdigest()
+
+
 META_FILE_LIMIT = 64 * 1024
 META_FIELDS = {'agentType': 'agent_type', 'description': 'agent_description'}
 
@@ -360,12 +365,17 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
                 entry_ids = tuple(message.get('id') for message in conversation['messages'])
                 # Without real entry ids two transcripts cannot be told apart, so both are kept
                 identified = bool(entry_ids) and all(isinstance(i, str) and i for i in entry_ids)
-                first = exported.get((parent_session, agent, entry_ids))
+                # Same ids are not enough: a copy can differ in what the entries say
+                key = (parent_session, agent, _messages_digest(conversation['messages'])) if identified else None
+                first = exported.get(key) if key else None
                 if first is not None:
                     first.setdefault('duplicate_source_files', []).append(conversation['source_file'])
+                    # The meta file sits beside only one of the copies
+                    for name, value in _agent_meta(agent_file).items():
+                        first.setdefault(name, value)
                     continue
-                if identified:
-                    exported[(parent_session, agent, entry_ids)] = conversation
+                if key:
+                    exported[key] = conversation
                 conversation.update(subagent=True, agent=agent, parent_session=parent_session,
                                     **_agent_meta(agent_file))
                 subagent_conversations.append(conversation)

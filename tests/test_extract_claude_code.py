@@ -559,3 +559,40 @@ class ExtractClaudeCodeSubagentTests(unittest.TestCase):
         _, subs = self.export()
 
         self.assertEqual(len(subs), 2)
+
+    def test_an_entry_id_that_is_not_a_string_does_not_stop_the_export(self):
+        self.parent()
+        rows = transcript("odd", SUB_USAGE, "sess-1", "odd")
+        rows[0]["uuid"] = ["not", "a", "string"]
+        self.nested("odd", rows=rows)
+
+        main, subs = self.export()
+
+        self.assertEqual(len(main), 1)
+        self.assertEqual([c["agent"] for c in subs], ["odd"])
+
+    def test_copies_with_the_same_entry_ids_but_different_content_are_both_kept(self):
+        self.parent()
+        self.nested("fork")
+        rows = transcript("fork", SUB_USAGE, "sess-1", "fork")
+        for row in rows:
+            usage = (row.get("message") or {}).get("usage")
+            if usage:
+                usage["output_tokens"] = 999
+        write_rows(self.project / "agent-fork.jsonl", rows)
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 2)
+        self.assertTrue(all("duplicate_source_files" not in c for c in subs))
+        self.assertEqual(sorted(m["usage"]["output_tokens"] for c in subs for m in c["messages"] if m.get("usage"))[-1], 999)
+
+    def test_the_nested_copy_keeps_its_meta_when_a_duplicate_sits_beside_the_session(self):
+        self.parent()
+        self.beside("meta")
+        self.nested("meta", meta={"agentType": "explorer", "description": "look around"})
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0].get("agent_type"), "explorer")
