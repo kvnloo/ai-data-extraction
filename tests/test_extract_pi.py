@@ -77,5 +77,52 @@ class ExtractPiTests(unittest.TestCase):
         self.assertIsNone(empty)
 
 
+    def test_messages_keep_the_entry_identity_they_came_from(self):
+        with tempfile.TemporaryDirectory() as d:
+            conv = extract_session(self.write(d, "s.jsonl", SESSION), "omp")
+        self.assertEqual([m["id"] for m in conv["messages"]], ["c", "d", "e", "f"])
+        self.assertEqual([m["parent_id"] for m in conv["messages"]], ["b", "c", "d", "e"])
+
+    def test_branches_share_entry_ids_so_a_common_prefix_can_be_deduplicated(self):
+        from extract_pi import extract_sessions
+        with tempfile.TemporaryDirectory() as d:
+            convs = extract_sessions(self.write(d, "s.jsonl", SESSION), "omp", all_branches=True)
+        self.assertEqual(len(convs), 2)
+        ids = [[m["id"] for m in c["messages"]] for c in convs]
+        # The abandoned branch and the active one both start from the same user entry.
+        self.assertEqual(set(ids[0]) & set(ids[1]), {"c"})
+        self.assertEqual(sorted(len(set(i)) for i in ids), [2, 4])
+
+    def test_request_timing_response_identity_and_full_usage_are_kept(self):
+        rows = [dict(r) for r in SESSION]
+        rows[4] = {**rows[4], "message": {
+            **rows[4]["message"], "responseId": "resp-1", "duration": 1840.5, "ttft": 310.2,
+            "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15,
+                      "reasoningTokens": 3, "cost": {"input": 0.1, "output": 0.2, "total": 0.3}}}}
+        with tempfile.TemporaryDirectory() as d:
+            a = extract_session(self.write(d, "s.jsonl", rows), "omp")["messages"][1]
+        self.assertEqual(a["response_id"], "resp-1")
+        self.assertEqual(a["duration_ms"], 1840.5)
+        self.assertEqual(a["ttft_ms"], 310.2)
+        self.assertEqual(a["usage"]["reasoningTokens"], 3)
+        self.assertEqual(a["usage"]["cost"], 0.3)
+        self.assertEqual(a["usage"]["totalTokens"], 15)
+
+    def test_messages_without_those_fields_export_as_before(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = extract_session(self.write(d, "s.jsonl", SESSION), "omp")["messages"][1]
+        for key in ("response_id", "duration_ms", "ttft_ms"):
+            self.assertNotIn(key, a)
+        self.assertEqual(a["usage"], {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15})
+
+    def test_structured_tool_output_is_flagged_not_silently_dropped(self):
+        rows = [dict(r) for r in SESSION]
+        rows[5] = {**rows[5], "message": {**rows[5]["message"], "details": {"fileCount": 2}}}
+        with tempfile.TemporaryDirectory() as d:
+            messages = extract_session(self.write(d, "s.jsonl", rows), "omp")["messages"]
+        self.assertTrue(messages[2]["has_details"])
+        self.assertNotIn("details", messages[2])
+
+
 if __name__ == "__main__":
     unittest.main()

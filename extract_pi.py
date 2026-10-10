@@ -127,6 +127,17 @@ def convert_message(m, entry_ts):
         if m.get('usage'):
             u = m['usage']
             msg['usage'] = {k: u.get(k) for k in ('input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens')}
+            if u.get('reasoningTokens') is not None:
+                msg['usage']['reasoningTokens'] = u['reasoningTokens']
+            if isinstance(u.get('cost'), dict) and u['cost'].get('total') is not None:
+                msg['usage']['cost'] = u['cost']['total']
+        # Which upstream answered and how long it took; needed to compare runs fairly
+        if m.get('responseId'):
+            msg['response_id'] = m['responseId']
+        if m.get('duration') is not None:
+            msg['duration_ms'] = m['duration']
+        if m.get('ttft') is not None:
+            msg['ttft_ms'] = m['ttft']
         if m.get('stopReason'):
             msg['stop_reason'] = m['stopReason']
         if m.get('errorMessage'):
@@ -138,6 +149,9 @@ def convert_message(m, entry_ts):
                'content': _text(content), 'is_error': bool(m.get('isError')), 'timestamp': ts}
         if _images(content):
             msg['images'] = _images(content)
+        # Structured output (file ranges, match counts, ...) is not exported; say it existed
+        if m.get('details'):
+            msg['has_details'] = True
         return msg
 
     return None
@@ -182,6 +196,10 @@ def _convert_session(entries, session_file, source, leaf_id=None):
                 if msg['role'] == 'assistant':
                     msg['model'] = msg.get('model') or current_model
                     msg['provider'] = msg.get('provider') or current_provider
+                # Source entry identity: traces a message to the transcript, and lets
+                # conversations exported from sibling branches be deduplicated
+                msg['id'] = e.get('id')
+                msg['parent_id'] = e.get('parentId')
                 messages.append(msg)
         elif t == 'model_change':
             mid = e.get('model') or '/'.join(x for x in (e.get('provider'), e.get('modelId')) if x)
@@ -195,10 +213,12 @@ def _convert_session(entries, session_file, source, leaf_id=None):
         elif t == 'custom_message':
             messages.append({'role': e.get('role') or 'system', 'content': _text(e.get('content')),
                 'timestamp': e.get('timestamp'), 'custom': True, 'custom_type': e.get('customType'),
-                'display': e.get('display'), 'details': e.get('details'), 'attribution': e.get('attribution')})
+                'display': e.get('display'), 'details': e.get('details'), 'attribution': e.get('attribution'),
+                'id': e.get('id'), 'parent_id': e.get('parentId')})
         elif t in ('compaction', 'branch_summary'):
             messages.append({'role': 'user', 'content': e.get('summary') or e.get('text') or '', 'timestamp': e.get('timestamp'),
-                             'event': t, 'compaction_summary': t == 'compaction', 'synthetic': True})
+                             'event': t, 'compaction_summary': t == 'compaction', 'synthetic': True,
+                             'id': e.get('id'), 'parent_id': e.get('parentId')})
         elif t in ('title_change', 'session_info'):
             title = e.get('title') or e.get('name') or title
 
