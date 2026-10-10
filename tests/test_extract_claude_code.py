@@ -1111,3 +1111,500 @@ class SayTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertIn(b"Error processing", raw.getvalue())
         self.assertIn(b"sess-\\udcff.jsonl", raw.getvalue())
+
+
+# Its own figures: an earlier test changes SUB_USAGE in place
+COPY_USAGE = {"input_tokens": 100, "output_tokens": 40}
+
+
+def reply(uuid, parent, usage=None, session_id="sess-1", agent_id="x"):
+    """One more response for a synthetic sub-agent transcript"""
+    return {"type": "assistant", "uuid": uuid, "parentUuid": parent, "timestamp": TS, "requestId": f"req-{uuid}",
+            "sessionId": session_id, "agentId": agent_id, "isSidechain": True,
+            "message": {"id": f"msg-{uuid}", "role": "assistant", "model": "claude-x", "usage": usage or dict(COPY_USAGE),
+                        "content": [{"type": "text", "text": f"{uuid} says"}]}}
+
+
+def output_per_conversation(conversations):
+    """Output tokens summed the plain way: every conversation, every message"""
+    return sum(m["usage"]["output_tokens"] for c in conversations for m in c["messages"] if m.get("usage"))
+
+
+def output_after_dedupe(conversations):
+    """Output tokens summed by the rule extract_claude_project_conversations documents for its copy fields"""
+    total = 0
+    for conversation in conversations:
+        own = conversation["source_file"]
+        if any(other["source_file"] < own for other in conversation.get("same_transcript_in", [])):
+            continue
+        skip = max([other["shared_leading_messages"] for other in conversation.get("shared_prefix_with", [])
+                    if other["source_file"] < own], default=0)
+        total += sum(m["usage"]["output_tokens"] for m in conversation["messages"][skip:] if m.get("usage"))
+    return total
+
+
+COPY_FIELDS = ("duplicate_source_files", "prefix_source_files", "reordered_source_files", "shared_prefix_with",
+               "same_transcript_in")
+
+
+class SubagentCopyTests(unittest.TestCase):
+    """Two files that hold one sub-agent transcript, when they are not the same byte for byte"""
+
+    setUp = ExtractClaudeCodeSubagentTests.setUp
+    parent = ExtractClaudeCodeSubagentTests.parent
+    export = ExtractClaudeCodeSubagentTests.export
+
+    def rows(self, replies=3, session_id="sess-1"):
+        return transcript("x", dict(COPY_USAGE), session_id, "x", replies=replies)
+
+    def nested(self, rows, session_id="sess-1", under=""):
+        return write_rows(self.project / session_id / "subagents" / under / "agent-x.jsonl", rows)
+
+    def beside(self, rows):
+        return write_rows(self.project / "agent-x.jsonl", rows)
+
+    def reconciles(self, subs, conversations, per_conversation, true_total):
+        self.assertEqual(len(subs), conversations)
+        self.assertEqual(output_per_conversation(subs), per_conversation)
+        self.assertEqual(output_after_dedupe(subs), true_total)
+
+    def test_a_copy_that_stops_early_is_left_out_and_the_complete_one_says_so(self):
+        self.parent()
+        rows = self.rows(replies=3)  # prompt, a note that is not exported, three responses
+        short = self.beside(rows[:3])
+        full = self.nested(rows)
+
+        mains, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+        self.assertEqual(subs[0]["source_file"], str(full))
+        self.assertEqual([m["id"] for m in subs[0]["messages"]], ["x-u", "x-s0", "x-s1", "x-s2"])
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(short)])
+        self.assertEqual(subs[0]["prefix_source_files"],
+                         [{"source_file": str(short), "compared_with": str(full), "shared_leading_messages": 2}])
+        self.assertEqual(mains[0]["subagent_sessions"], ["x"])
+
+    def test_the_complete_copy_is_kept_whichever_file_is_read_first(self):
+        self.parent()
+        rows = self.rows(replies=3)
+        full = self.beside(rows)  # the file beside the sessions is read first
+        short = self.nested(rows[:4])
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+        self.assertEqual(subs[0]["source_file"], str(full))
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(short)])
+        self.assertEqual(subs[0]["prefix_source_files"],
+                         [{"source_file": str(short), "compared_with": str(full), "shared_leading_messages": 3}])
+
+    def test_a_copy_cut_in_the_middle_of_a_line_is_a_shorter_copy(self):
+        self.parent()
+        full = self.nested(self.rows(replies=3))
+        text = full.read_text()
+        cut = self.beside([])
+        cut.write_text(text[:len(text) - 40])
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+        self.assertEqual(subs[0]["source_file"], str(full))
+        self.assertEqual(subs[0]["skipped_lines"], 0)
+        self.assertEqual(subs[0]["prefix_source_files"],
+                         [{"source_file": str(cut), "compared_with": str(full), "shared_leading_messages": 3}])
+
+    def test_three_copies_of_growing_length_leave_the_longest(self):
+        self.parent()
+        rows = self.rows(replies=3)
+        first = self.beside(rows[:3])
+        second = self.nested(rows[:4])
+        third = self.nested(rows, under="later")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+        self.assertEqual(subs[0]["source_file"], str(third))
+        self.assertEqual(sorted(subs[0]["duplicate_source_files"]), sorted([str(first), str(second)]))
+        self.assertEqual(sorted(subs[0]["prefix_source_files"], key=lambda r: r["shared_leading_messages"]),
+                         [{"source_file": str(first), "compared_with": str(second), "shared_leading_messages": 2},
+                          {"source_file": str(second), "compared_with": str(third), "shared_leading_messages": 3}])
+
+    def test_the_shorter_copy_still_gives_its_meta_file(self):
+        self.parent()
+        rows = self.rows(replies=2)
+        self.beside(rows)
+        short = self.nested(rows[:3])
+        short.with_name("agent-x.meta.json").write_text(json.dumps({"agentType": "explorer"}))
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["agent_type"], "explorer")
+
+    def test_copies_that_part_ways_are_both_kept_and_each_names_the_other(self):
+        self.parent()
+        rows = self.rows(replies=2)
+        left = self.beside(rows + [reply("left", "x-s1")])
+        right = self.nested(rows + [reply("right", "x-s1"), reply("right-2", "right")])
+
+        _, subs = self.export()
+
+        # Five responses were made: two shared, one on one side, two on the other
+        self.reconciles(subs, conversations=2, per_conversation=280, true_total=200)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(by_file[str(left)]["shared_prefix_with"],
+                         [{"source_file": str(right), "shared_leading_messages": 3}])
+        self.assertEqual(by_file[str(right)]["shared_prefix_with"],
+                         [{"source_file": str(left), "shared_leading_messages": 3}])
+        self.assertEqual([m["id"] for m in by_file[str(left)]["messages"]], ["x-u", "x-s0", "x-s1", "left"])
+        self.assertEqual([m["id"] for m in by_file[str(right)]["messages"]],
+                         ["x-u", "x-s0", "x-s1", "right", "right-2"])
+        for conversation in subs:
+            self.assertNotIn("duplicate_source_files", conversation)
+            self.assertNotIn("prefix_source_files", conversation)
+
+    def test_a_copy_that_parts_ways_names_the_file_that_is_exported(self):
+        self.parent()
+        rows = self.rows(replies=2)
+        short = self.beside(rows[:3])  # left out: the next file continues it
+        left = self.nested(rows + [reply("left", "x-s1")])
+        right = self.nested(rows + [reply("right", "x-s1")], under="later")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=240, true_total=160)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(sorted(by_file), sorted([str(left), str(right)]))
+        self.assertEqual(by_file[str(right)]["shared_prefix_with"],
+                         [{"source_file": str(left), "shared_leading_messages": 3}])
+        self.assertEqual(by_file[str(left)]["shared_prefix_with"],
+                         [{"source_file": str(right), "shared_leading_messages": 3}])
+        recorded = [r for c in subs for r in c.get("prefix_source_files", [])]
+        self.assertEqual(recorded, [{"source_file": str(short), "compared_with": str(left), "shared_leading_messages": 2}])
+
+    def test_transcripts_that_share_no_leading_message_carry_no_copy_fields(self):
+        self.parent()
+        rows = self.rows(replies=2)
+        self.beside(rows)
+        self.nested([reply("other", None)] + rows[2:])
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=200, true_total=200)
+        for conversation in subs:
+            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+
+    def test_the_same_entries_in_another_order_are_exported_once_in_the_order_of_their_parent_ids(self):
+        rows = self.rows(replies=3)
+        mixed = [rows[0], rows[1], rows[4], rows[2], rows[3]]
+        for in_order, nested_rows, beside_rows in (("nested", rows, mixed), ("beside", mixed, rows)):
+            with self.subTest(in_order=in_order):
+                nested, beside = self.nested(nested_rows), self.beside(beside_rows)
+                kept, other = (nested, beside) if in_order == "nested" else (beside, nested)
+
+                _, subs = self.export()
+
+                self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+                self.assertEqual(subs[0]["source_file"], str(kept))
+                self.assertEqual([m["id"] for m in subs[0]["messages"]], ["x-u", "x-s0", "x-s1", "x-s2"])
+                self.assertEqual(subs[0]["duplicate_source_files"], [str(other)])
+                self.assertEqual(subs[0]["reordered_source_files"],
+                                 [{"source_file": str(other), "compared_with": str(kept), "kept_by": "parent_id_chain"}])
+                self.assertNotIn("prefix_source_files", subs[0])
+
+    def test_parent_ids_are_followed_through_entries_that_are_not_exported(self):
+        # x-s0 answers a note that is not exported; the note answers the prompt
+        rows = self.rows(replies=1)
+        mixed = [rows[2], rows[1], rows[0]]
+        beside, nested = self.beside(rows), self.nested(mixed)
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["source_file"], str(beside))
+        self.assertEqual(subs[0]["reordered_source_files"],
+                         [{"source_file": str(nested), "compared_with": str(beside), "kept_by": "parent_id_chain"}])
+
+    def test_without_an_order_to_follow_the_copy_under_the_session_is_kept(self):
+        def unlinked(rows):
+            return [dict(row, parentUuid=None) for row in rows]
+
+        rows = unlinked(self.rows(replies=3))
+        mixed = [rows[0], rows[1], rows[4], rows[2], rows[3]]
+        for under_session, nested_rows, beside_rows in (("in order", rows, mixed), ("mixed", mixed, rows)):
+            with self.subTest(under_session=under_session):
+                nested, beside = self.nested(nested_rows), self.beside(beside_rows)
+
+                _, subs = self.export()
+
+                self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+                self.assertEqual(subs[0]["source_file"], str(nested))
+                self.assertEqual(subs[0]["duplicate_source_files"], [str(beside)])
+                self.assertEqual(subs[0]["reordered_source_files"],
+                                 [{"source_file": str(beside), "compared_with": str(nested), "kept_by": "nested_layout"}])
+
+    def test_neither_order_following_the_parent_ids_falls_back_to_the_copy_under_the_session(self):
+        rows = self.rows(replies=3)
+        beside = self.beside([rows[0], rows[1], rows[4], rows[2], rows[3]])
+        nested = self.nested([rows[0], rows[1], rows[3], rows[2], rows[4]])
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["source_file"], str(nested))
+        self.assertEqual(subs[0]["reordered_source_files"],
+                         [{"source_file": str(beside), "compared_with": str(nested), "kept_by": "nested_layout"}])
+
+    def test_two_copies_under_the_session_with_no_order_to_follow_keep_the_first_found(self):
+        rows = [dict(row, parentUuid=None) for row in self.rows(replies=3)]
+        first = self.nested(rows)
+        second = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]], under="later")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+        self.assertEqual(subs[0]["source_file"], str(first))
+        self.assertEqual(subs[0]["reordered_source_files"],
+                         [{"source_file": str(second), "compared_with": str(first), "kept_by": "first_found"}])
+
+    def test_a_parent_id_that_is_not_text_does_not_stop_the_comparison(self):
+        self.parent()
+        rows = self.rows(replies=3)
+        rows[3]["parentUuid"] = ["not", "text"]
+        nested = self.nested(rows)
+        self.beside([rows[0], rows[1], rows[4], rows[2], rows[3]])
+
+        mains, subs = self.export()
+
+        self.assertEqual(len(mains), 1)
+        self.assertEqual([c["source_file"] for c in subs], [str(nested)])
+
+    def test_the_same_entries_a_different_number_of_times_are_not_one_transcript(self):
+        rows = self.rows(replies=2)
+        once_twice = self.beside([rows[0], rows[1], rows[2], rows[3], rows[3]])
+        twice_once = self.nested([rows[0], rows[1], rows[2], rows[2], rows[3]])
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 2)
+        self.assertEqual(sorted(c["source_file"] for c in subs), sorted([str(once_twice), str(twice_once)]))
+        for conversation in subs:
+            self.assertNotIn("duplicate_source_files", conversation)
+            self.assertNotIn("reordered_source_files", conversation)
+            self.assertEqual(conversation["shared_prefix_with"][0]["shared_leading_messages"], 2)
+
+    def test_one_transcript_under_two_sessions_is_exported_for_each_and_each_names_the_other(self):
+        self.parent("sess-1")
+        self.parent("sess-2")
+        rows = self.rows(replies=3)
+        one = self.nested(rows, "sess-1")
+        two = self.nested(rows, "sess-2")
+
+        mains, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=240, true_total=120)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(by_session["sess-1"]["same_transcript_in"], [{"parent_session": "sess-2", "source_file": str(two)}])
+        self.assertEqual(by_session["sess-2"]["same_transcript_in"], [{"parent_session": "sess-1", "source_file": str(one)}])
+        for conversation in subs:
+            self.assertNotIn("duplicate_source_files", conversation)
+        self.assertEqual({m["session_id"]: m["subagent_sessions"] for m in mains}, {"sess-1": ["x"], "sess-2": ["x"]})
+
+    def test_one_transcript_under_three_sessions_names_both_others(self):
+        rows = self.rows(replies=1)
+        files = {session: str(self.nested(rows, session)) for session in ("sess-1", "sess-2", "sess-3")}
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=3, per_conversation=120, true_total=40)
+        for conversation in subs:
+            others = sorted(s for s in files if s != conversation["parent_session"])
+            self.assertEqual(sorted(conversation["same_transcript_in"], key=lambda r: r["parent_session"]),
+                             [{"parent_session": s, "source_file": files[s]} for s in others])
+
+    def test_different_transcripts_under_two_sessions_do_not_name_each_other(self):
+        self.nested(self.rows(replies=2), "sess-1")
+        self.nested(self.rows(replies=3), "sess-2")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=200, true_total=200)
+        for conversation in subs:
+            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+
+    def test_copies_without_entry_ids_are_still_never_merged(self):
+        rows = self.rows(replies=3)
+        for row in rows:
+            row.pop("uuid", None)
+            row.pop("parentUuid", None)
+        self.beside(rows[:3])
+        self.nested(rows)
+        self.nested(rows, "sess-2")
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 3)
+        for conversation in subs:
+            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+
+    def test_copies_that_cannot_be_compared_are_all_exported_without_copy_fields(self):
+        rows = self.rows(replies=3)
+        self.beside(rows[:3])
+        self.nested(rows)
+        self.nested(rows, "sess-2")
+        for error in (RecursionError("too deep"), TypeError("not comparable"), ValueError("not comparable")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(extract_claude_code, "_messages_digest", side_effect=error):
+                    _, subs = self.export()
+                self.assertEqual(len(subs), 3)
+                for conversation in subs:
+                    self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+
+    def test_the_session_itself_is_exported_the_same_whatever_copies_its_sub_agent_has(self):
+        self.parent()
+        alone = json.dumps(self.export()[0][0], ensure_ascii=False)
+        rows = self.rows(replies=3)
+        self.beside(rows[:3])
+        self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]])
+        self.nested(rows + [reply("more", "x-s2")], under="later")
+
+        mains, subs = self.export()
+
+        self.assertEqual(mains[0].pop("subagent_sessions"), ["x"])
+        self.assertEqual(json.dumps(mains[0], ensure_ascii=False), alone)
+        # every response the files hold is in what was exported
+        self.assertEqual({m["id"] for c in subs for m in c["messages"]}, {"x-u", "x-s0", "x-s1", "x-s2", "more"})
+
+    def test_an_exact_copy_is_only_listed_and_the_first_file_found_is_kept(self):
+        rows = self.rows(replies=3)
+        beside, nested = self.beside(rows), self.nested(rows)
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
+        self.assertEqual(subs[0]["source_file"], str(beside))
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(nested)])
+        # nothing else is added to what a transcript found once has
+        nested.unlink()
+        self.assertEqual(set(subs[0]) - set(self.export()[1][0]), {"duplicate_source_files"})
+
+    def test_a_longer_copy_carries_what_the_copy_it_replaces_had_recorded(self):
+        rows = self.rows(replies=3)
+        in_order = self.beside(rows)
+        mixed = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]])
+        longer = self.nested(rows + [reply("more", "x-s2")], under="later")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=1, per_conversation=160, true_total=160)
+        self.assertEqual(subs[0]["source_file"], str(longer))
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(in_order), str(mixed)])
+        self.assertEqual(subs[0]["prefix_source_files"],
+                         [{"source_file": str(in_order), "compared_with": str(longer), "shared_leading_messages": 4}])
+        # the copy in another order was compared with the file that is itself left out now
+        self.assertEqual(subs[0]["reordered_source_files"],
+                         [{"source_file": str(mixed), "compared_with": str(in_order), "kept_by": "parent_id_chain"}])
+
+    def test_parent_ids_that_go_round_in_a_circle_do_not_stop_the_export(self):
+        rows = self.rows(replies=1)
+        rows[0]["parentUuid"] = "note-2"
+        rows[1]["parentUuid"] = "note-2"
+        rows.insert(2, {"type": "attachment", "uuid": "note-2", "parentUuid": "x-a", "timestamp": TS,
+                        "attachment": {"type": "date"}})
+        self.nested(rows)
+
+        _, subs = self.export()
+
+        self.assertEqual([[m["id"] for m in c["messages"]] for c in subs], [["x-u", "x-s0"]])
+
+    def test_one_transcript_under_two_sessions_as_two_agents_is_two_transcripts(self):
+        rows = self.rows(replies=2)
+        self.nested(rows, "sess-1")
+        write_rows(self.project / "sess-2" / "subagents" / "agent-y.jsonl", rows)
+
+        _, subs = self.export()
+
+        self.assertEqual(sorted(c["agent"] for c in subs), ["x", "y"])
+        for conversation in subs:
+            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+
+    def test_one_transcript_under_two_sessions_in_two_orders_is_still_named_on_each(self):
+        rows = self.rows(replies=3)
+        one = self.nested(rows, "sess-1")
+        two = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]], "sess-2")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=240, true_total=120)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(by_session["sess-1"]["same_transcript_in"], [{"parent_session": "sess-2", "source_file": str(two)}])
+        self.assertEqual(by_session["sess-2"]["same_transcript_in"], [{"parent_session": "sess-1", "source_file": str(one)}])
+
+    def test_a_transcript_whose_session_is_not_known_names_the_copy_under_a_session(self):
+        rows = [{k: v for k, v in row.items() if k != "sessionId"} for row in self.rows(replies=2)]
+        beside, nested = self.beside(rows), self.nested(rows)
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=160, true_total=80)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(by_session[None]["same_transcript_in"], [{"parent_session": "sess-1", "source_file": str(nested)}])
+        self.assertEqual(by_session["sess-1"]["same_transcript_in"], [{"parent_session": None, "source_file": str(beside)}])
+
+    def test_copies_with_empty_entry_ids_are_never_merged(self):
+        rows = [dict(row, uuid="", parentUuid=None) for row in self.rows(replies=2)]
+        self.beside(rows)
+        self.nested(rows)
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 2)
+        for conversation in subs:
+            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+
+    def test_a_parent_id_that_names_nothing_in_the_file_does_not_count_against_an_order(self):
+        rows = self.rows(replies=3)
+        rows[0]["parentUuid"] = "an-entry-of-the-session"
+        beside = self.beside(rows)
+        nested = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]])
+
+        _, subs = self.export()
+
+        self.assertEqual([c["source_file"] for c in subs], [str(beside)])
+        self.assertEqual(subs[0]["reordered_source_files"],
+                         [{"source_file": str(nested), "compared_with": str(beside), "kept_by": "parent_id_chain"}])
+
+    def test_an_entry_written_twice_is_in_order_once_it_has_been_seen(self):
+        rows = self.rows(replies=3)
+        prompt, note, first, second, third = rows
+        beside = self.beside([prompt, note, first, second, first, third])
+        nested = self.nested([first, prompt, note, second, first, third])
+
+        _, subs = self.export()
+
+        self.assertEqual([c["source_file"] for c in subs], [str(beside)])
+        self.assertEqual(subs[0]["reordered_source_files"],
+                         [{"source_file": str(nested), "compared_with": str(beside), "kept_by": "parent_id_chain"}])
+
+    def test_the_kept_copy_keeps_its_own_meta_when_both_copies_have_one(self):
+        rows = self.rows(replies=2)
+        self.beside(rows[:3]).with_name("agent-x.meta.json").write_text(
+            json.dumps({"agentType": "from-the-short-copy", "description": "only the short copy says this"}))
+        self.nested(rows).with_name("agent-x.meta.json").write_text(json.dumps({"agentType": "from-the-full-copy"}))
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["agent_type"], "from-the-full-copy")
+        self.assertEqual(subs[0]["agent_description"], "only the short copy says this")
+
+    def test_a_copy_is_compared_with_every_file_found_before_it(self):
+        rows = self.rows(replies=2)
+        other = self.beside([reply("other", None)])
+        first = self.nested(rows)
+        second = self.nested(rows, under="later")
+
+        _, subs = self.export()
+
+        self.assertEqual(sorted(c["source_file"] for c in subs), sorted([str(other), str(first)]))
+        self.assertEqual([c.get("duplicate_source_files") for c in subs], [None, [str(second)]])
