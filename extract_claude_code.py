@@ -366,7 +366,12 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
                 # Without real entry ids two transcripts cannot be told apart, so both are kept
                 identified = bool(entry_ids) and all(isinstance(i, str) and i for i in entry_ids)
                 # Same ids are not enough: a copy can differ in what the entries say
-                key = (parent_session, agent, _messages_digest(conversation['messages'])) if identified else None
+                key = None
+                if identified:
+                    try:
+                        key = (parent_session, agent, _messages_digest(conversation['messages']))
+                    except (RecursionError, TypeError, ValueError):
+                        key = None  # cannot be compared, so it is kept as its own conversation
                 first = exported.get(key) if key else None
                 if first is not None:
                     first.setdefault('duplicate_source_files', []).append(conversation['source_file'])

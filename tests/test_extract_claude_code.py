@@ -596,3 +596,17 @@ class ExtractClaudeCodeSubagentTests(unittest.TestCase):
 
         self.assertEqual(len(subs), 1)
         self.assertEqual(subs[0].get("agent_type"), "explorer")
+
+    def test_content_too_deep_to_compare_is_exported_without_comparing(self):
+        from unittest import mock
+        import extract_claude_code
+
+        self.parent()
+        self.nested("deep")
+        self.beside("deep")
+        with mock.patch.object(extract_claude_code, "_messages_digest", side_effect=RecursionError("too deep")):
+            main, subs = self.export()
+
+        # Nothing can be compared, so nothing is merged and nothing is lost
+        self.assertEqual(len(main), 1)
+        self.assertEqual([c["agent"] for c in subs], ["deep", "deep"])
