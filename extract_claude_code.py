@@ -69,12 +69,15 @@ def find_claude_installations():
     return list(dict.fromkeys(locations))  # Remove duplicates, keep discovery order
 
 
-USAGE_KEYS = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')
+ENTRY_FLAGS = {'isSidechain': 'is_sidechain', 'isMeta': 'is_meta', 'isCompactSummary': 'is_compact_summary'}
 
 
 def _identity(obj):
     """Source entry identity, so an exported message can be traced back to the transcript"""
-    return {'id': obj.get('uuid'), 'parent_id': obj.get('parentUuid')}
+    identity = {'id': obj.get('uuid'), 'parent_id': obj.get('parentUuid')}
+    # A sub-agent turn, an injected note and a compaction summary are not ordinary turns
+    identity.update({name: True for key, name in ENTRY_FLAGS.items() if obj.get(key)})
+    return identity
 
 
 def _block_text(content):
@@ -85,6 +88,17 @@ def _block_text(content):
         return '\n'.join(item if isinstance(item, str) else item.get('text', '') for item in content
                          if isinstance(item, str) or (isinstance(item, dict) and item.get('type') == 'text'))
     return ''
+
+
+def _omitted_blocks(content):
+    """What a tool result held besides text (an image, a document), by type and size, without its bytes"""
+    blocks = []
+    for item in content if isinstance(content, list) else []:
+        if isinstance(item, dict) and item.get('type') != 'text':
+            source = item.get('source') or {}
+            blocks.append({'type': item.get('type'), 'media_type': source.get('media_type'),
+                           'encoded_size': len(source.get('data') or '')})
+    return blocks
 
 def extract_claude_project_conversations(project_dir):
     """Extract conversations from a Claude project directory with full context"""
@@ -108,6 +122,8 @@ def extract_claude_project_conversations(project_dir):
         try:
             messages = []
             omitted_attachments = {}
+            omitted_entries = {}
+            skipped_lines = 0
             session_id = jsonl_file.stem
             project_path = None
             project_name = jsonl_file.parent.name if jsonl_file.parent.name != 'projects' else None
@@ -117,6 +133,7 @@ def extract_claude_project_conversations(project_dir):
                     if not line.strip():
                         continue
 
+                    exported = len(messages)
                     try:
                         obj = json.loads(line)
                         msg_type = obj.get('type')
@@ -129,14 +146,18 @@ def extract_claude_project_conversations(project_dir):
                             if isinstance(content, list):
                                 for item in content:
                                     if isinstance(item, dict) and item.get('type') == 'tool_result':
-                                        messages.append({
+                                        tool_msg = {
                                             'role': 'tool',
                                             'tool_call_id': item.get('tool_use_id'),
                                             'content': _block_text(item.get('content')),
                                             'is_error': bool(item.get('is_error')),
                                             'timestamp': obj.get('timestamp'),
                                             **_identity(obj)
-                                        })
+                                        }
+                                        omitted = _omitted_blocks(item.get('content'))
+                                        if omitted:
+                                            tool_msg['omitted_content'] = omitted
+                                        messages.append(tool_msg)
                                 content = [item for item in content
                                            if not (isinstance(item, dict) and item.get('type') == 'tool_result')]
 
@@ -182,7 +203,7 @@ def extract_claude_project_conversations(project_dir):
                                 text_parts.append(content)
 
                             full_text = '\n'.join(text_parts)
-                            if full_text or tool_uses:
+                            if full_text or tool_uses or thinking:
                                 msg = {
                                     'role': 'assistant',
                                     'content': full_text,
@@ -199,7 +220,7 @@ def extract_claude_project_conversations(project_dir):
                                     msg['request_id'] = obj['requestId']
                                 usage = message.get('usage')
                                 if isinstance(usage, dict):
-                                    msg['usage'] = {k: usage[k] for k in USAGE_KEYS if k in usage}
+                                    msg['usage'] = dict(usage)
 
                                 if thinking:
                                     msg['reasoning'] = '\n'.join(thinking)
@@ -236,7 +257,18 @@ def extract_claude_project_conversations(project_dir):
                                     messages[-1]['tool_results'] = []
                                 messages[-1]['tool_results'].append(tool_result)
 
-                    except json.JSONDecodeError:
+                        if len(messages) == exported and obj.get('uuid'):
+                            # Nothing was exported for this entry; keep its link so a parent_id
+                            # that names it can still be followed
+                            omitted = {'type': msg_type, 'parent_id': obj.get('parentUuid')}
+                            if obj.get('logicalParentUuid'):
+                                omitted['logical_parent_id'] = obj['logicalParentUuid']
+                            omitted_entries[obj['uuid']] = omitted
+
+                    except (json.JSONDecodeError, AttributeError, TypeError):
+                        # A line that is not a well-formed entry costs that line, not the session
+                        del messages[exported:]
+                        skipped_lines += 1
                         continue
 
             if messages:
@@ -247,6 +279,8 @@ def extract_claude_project_conversations(project_dir):
                     'project_path': project_path,
                     'project_name': project_name,
                     'omitted_attachments': omitted_attachments,
+                    'omitted_entries': omitted_entries,
+                    'skipped_lines': skipped_lines,
                     'source_file': str(jsonl_file),
                     'installation': str(project_dir)
                 })
