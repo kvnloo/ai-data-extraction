@@ -112,7 +112,7 @@ def _agent_meta(agent_file):
         if not meta_file.is_file() or meta_file.stat().st_size > META_FILE_LIMIT:
             return {}
         meta = json.loads(meta_file.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(meta, dict):
         return {}
@@ -349,7 +349,8 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
         for agent_file, parent_session in subagent_files:
             agent = agent_file.stem[len('agent-'):]
             conversation, entry_session_id = convert(agent_file, project_name)
-            parent_session = parent_session or entry_session_id
+            # Only a string can name a session; anything else in that field is noise
+            parent_session = parent_session or (entry_session_id if isinstance(entry_session_id, str) else None)
             if parent_session:
                 agents_of.setdefault(parent_session, []).append(agent)
             if conversation:
@@ -360,7 +361,7 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
         # A sub-agent's usage is not in its session's transcript; say that it exists
         for parent_session, agents in agents_of.items():
             if parent_session in sessions:
-                sessions[parent_session]['subagent_sessions'] = sorted(agents)
+                sessions[parent_session]['subagent_sessions'] = sorted(set(agents))
 
     return conversations + (subagent_conversations if include_subagents else [])
 

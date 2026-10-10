@@ -465,3 +465,38 @@ class ExtractClaudeCodeSubagentTests(unittest.TestCase):
                          [("n1", "sess-1"), ("o1", "sess-1")])
         main = next(c for c in conversations if not c.get("subagent"))
         self.assertEqual(main["subagent_sessions"], ["n1", "o1"])
+
+    def test_a_sub_agent_file_with_an_unusable_session_id_does_not_stop_the_export(self):
+        self.parent()
+        for agent_id, bad in (("list", ["sess-1"]), ("dict", {"id": "sess-1"}), ("int", 7)):
+            rows = transcript(agent_id, SUB_USAGE, "sess-1", agent_id)
+            for row in rows:
+                row["sessionId"] = bad
+            write_rows(self.project / f"agent-{agent_id}.jsonl", rows)
+
+        main, subs = self.export()
+
+        self.assertEqual(len(main), 1)
+        # The transcripts are still exported; they just cannot be tied to a session
+        self.assertEqual([c["agent"] for c in subs], ["dict", "int", "list"])
+        self.assertEqual({c["parent_session"] for c in subs}, {None})
+        self.assertNotIn("subagent_sessions", main[0])
+
+    def test_a_corrupt_meta_file_costs_only_the_meta_fields(self):
+        self.parent()
+        self.nested("deep", meta="[" * 60000)
+
+        main, subs = self.export()
+
+        self.assertEqual([c["agent"] for c in subs], ["deep"])
+        self.assertNotIn("agent_type", subs[0])
+        self.assertEqual(main[0]["subagent_sessions"], ["deep"])
+
+    def test_one_agent_found_in_both_layouts_is_listed_once_on_its_session(self):
+        self.parent()
+        self.nested("dup")
+        self.beside("dup")
+
+        main, _ = self.export()
+
+        self.assertEqual(main[0]["subagent_sessions"], ["dup"])
