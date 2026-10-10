@@ -610,3 +610,206 @@ class ExtractClaudeCodeSubagentTests(unittest.TestCase):
         # Nothing can be compared, so nothing is merged and nothing is lost
         self.assertEqual(len(main), 1)
         self.assertEqual([c["agent"] for c in subs], ["deep", "deep"])
+
+    def test_content_that_cannot_be_compared_for_any_reason_is_still_exported(self):
+        self.parent()
+        self.nested("odd")
+        self.beside("odd")
+        for error in (TypeError("not comparable"), ValueError("not comparable")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(extract_claude_code, "_messages_digest", side_effect=error):
+                    mains, subs = self.export()
+                self.assertEqual(len(mains), 1)
+                self.assertEqual([c["agent"] for c in subs], ["odd", "odd"])
+
+    def test_sessions_come_out_in_the_order_the_directory_lists_them(self):
+        # The order sessions had before sub-agents were exported: whatever the directory gives
+        for session_id in ("sess-b", "sess-a", "sess-c"):
+            self.parent(session_id)
+        self.nested("x", "sess-a")
+        other = self.root / "projects" / "-other"
+        write_rows(other / "sess-z.jsonl", transcript("z", PARENT_USAGE, "sess-z"))
+        listed = {"glob": Path.glob, "iterdir": Path.iterdir}
+
+        def backwards(name):
+            return lambda path, *args: iter(sorted(listed[name](path, *args), reverse=True))
+
+        with mock.patch.object(Path, "glob", backwards("glob")), mock.patch.object(Path, "iterdir", backwards("iterdir")):
+            mains, subs = self.export()
+        self.assertEqual([c["session_id"] for c in mains], ["sess-c", "sess-b", "sess-a", "sess-z"])
+        self.assertEqual([c["agent"] for c in subs], ["x"])
+
+
+SURROGATE = "bad \ud800 text"
+
+
+def deep(levels, leaf='"x"'):
+    """JSON text for a value nested `levels` lists deep"""
+    return "[" * levels + leaf + "]" * levels
+
+
+def depth_that_parses_but_cannot_be_written():
+    """A nesting depth this interpreter can read from a line but not serialise again, or None"""
+    reads, fails = [], []
+    for levels in range(1000, 120000, 1000):
+        try:
+            value = json.loads(deep(levels))
+        except RecursionError:
+            break
+        reads.append(levels)
+        try:
+            json.dumps(value)
+        except RecursionError:
+            fails.append(levels)
+    return fails[len(fails) // 2] if fails else None
+
+
+class ExtractClaudeCodeWholeExportTests(unittest.TestCase):
+    """main() over a synthetic home directory: what reaches the output file"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name) / "home"
+        self.project = self.home / ".claude" / "projects" / "-work"
+        self.project.mkdir(parents=True)
+        self.out = Path(tmp.name) / "out"
+        self.out.mkdir()
+        write_rows(self.project / "sess-1.jsonl", transcript("main", PARENT_USAGE, "sess-1"))
+
+    def sub(self, agent_id, rows=None, session_id="sess-1", beside=False):
+        path = (self.project / f"agent-{agent_id}.jsonl" if beside
+                else self.project / session_id / "subagents" / f"agent-{agent_id}.jsonl")
+        return write_rows(path, transcript(agent_id, SUB_USAGE, session_id, agent_id) if rows is None else rows)
+
+    def run_main(self, encoding=None):
+        """Run the whole export; returns (conversations in the output file by session id, printed text)"""
+        import contextlib
+        import io
+
+        real_open = open
+
+        def open_as(path, mode="r", **kwargs):
+            if mode == "w" and encoding:
+                kwargs["encoding"] = encoding
+            return real_open(path, mode, **kwargs)
+
+        cwd = os.getcwd()
+        os.chdir(self.out)
+        printed = io.StringIO()
+        try:
+            # Only the synthetic home is visible: no configured directory, no real one
+            with mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=True), \
+                    mock.patch.object(extract_claude_code, "open", open_as, create=True), \
+                    contextlib.redirect_stdout(printed):
+                extract_claude_code.main()
+        finally:
+            os.chdir(cwd)
+        return self.written(), printed.getvalue()
+
+    def written(self):
+        files = list((self.out / "extracted_data").glob("claude_code_conversations_*.jsonl"))
+        self.assertEqual(len(files), 1)
+        lines = files[0].read_text().splitlines()
+        return [json.loads(line) for line in lines]
+
+    def test_a_sub_agent_with_text_that_cannot_be_encoded_is_written_escaped(self):
+        rows = transcript("sur", SUB_USAGE, "sess-1", "sur")
+        rows[0]["message"]["content"] = SURROGATE
+        self.sub("sur", rows)
+        self.sub("fine")
+        self.sub("zed")
+        written, _ = self.run_main()
+        self.assertEqual([c["session_id"] for c in written], ["sess-1", "agent-fine", "agent-sur", "agent-zed"])
+        self.assertEqual(written[2]["messages"][0]["content"], SURROGATE)
+        self.assertEqual(written[0]["subagent_sessions"], ["fine", "sur", "zed"])
+
+    def test_a_sub_agent_whose_meta_cannot_be_encoded_is_written_escaped(self):
+        path = self.sub("sur")
+        path.with_name("agent-sur.meta.json").write_text(json.dumps({"agentType": SURROGATE}))
+        self.sub("copy", beside=True)
+        written, _ = self.run_main()
+        self.assertEqual([c["session_id"] for c in written], ["sess-1", "agent-copy", "agent-sur"])
+        self.assertEqual(written[2]["agent_type"], SURROGATE)
+
+    def test_a_sub_agent_is_written_escaped_when_the_output_encoding_cannot_hold_it(self):
+        rows = transcript("acc", SUB_USAGE, "sess-1", "acc")
+        rows[0]["message"]["content"] = "café"
+        self.sub("acc", rows)
+        written, _ = self.run_main(encoding="ascii")
+        self.assertEqual([c["session_id"] for c in written], ["sess-1", "agent-acc"])
+        self.assertEqual(written[1]["messages"][0]["content"], "café")
+
+    def test_text_the_output_can_hold_is_written_as_it_is(self):
+        rows = transcript("acc", SUB_USAGE, "sess-1", "acc")
+        rows[0]["message"]["content"] = "café"
+        self.sub("acc", rows)
+        self.run_main(encoding="utf-8")
+        text = next((self.out / "extracted_data").glob("*.jsonl")).read_text(encoding="utf-8")
+        self.assertIn("café", text)
+
+    def test_a_session_that_cannot_be_encoded_still_stops_the_export(self):
+        # Unchanged from before sub-agents were exported: a session is never dropped or rewritten quietly
+        rows = transcript("main", PARENT_USAGE, "sess-1")
+        rows[0]["message"]["content"] = SURROGATE
+        write_rows(self.project / "sess-1.jsonl", rows)
+        with self.assertRaises(UnicodeEncodeError):
+            self.run_main()
+
+    def test_a_sub_agent_that_cannot_be_serialised_costs_only_itself(self):
+        self.sub("a")
+        self.sub("fine")
+        self.sub("z", beside=True)
+        write_rows(self.project / "sess-2.jsonl", transcript("two", PARENT_USAGE, "sess-2"))
+        self.sub("other", session_id="sess-2")
+        real_dumps = json.dumps
+
+        def dumps(value, **kwargs):
+            # Stands in for nesting too deep to serialise, which no fixture reaches on every interpreter
+            if isinstance(value, dict) and value.get("agent") in ("a", "z"):
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_dumps(value, **kwargs)
+
+        with mock.patch.object(extract_claude_code.json, "dumps", dumps):
+            written, printed = self.run_main()
+        self.assertEqual(sorted(c["session_id"] for c in written),
+                         ["agent-fine", "agent-other", "sess-1", "sess-2"])
+        by_id = {c["session_id"]: c for c in written}
+        # The session still says the sub-agents exist, and the run says which files it left out
+        self.assertEqual(by_id["sess-1"]["subagent_sessions"], ["a", "fine", "z"])
+        for agent in ("a", "z"):
+            self.assertIn(f"agent-{agent}.jsonl", printed)
+        self.assertNotIn("agent-fine.jsonl", printed)
+
+    def test_a_session_that_cannot_be_serialised_still_stops_the_export(self):
+        real_dumps = json.dumps
+
+        def dumps(value, **kwargs):
+            if isinstance(value, dict) and value.get("session_id") == "sess-1":
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_dumps(value, **kwargs)
+
+        with mock.patch.object(extract_claude_code.json, "dumps", dumps):
+            with self.assertRaises(RecursionError):
+                self.run_main()
+
+    def test_sub_agent_content_really_too_deep_to_serialise_does_not_stop_the_export(self):
+        levels = depth_that_parses_but_cannot_be_written()
+        if levels is None:
+            self.skipTest("this interpreter refuses to read any nesting it cannot write")
+        row = json.dumps({"type": "assistant", "uuid": "deep-s0", "parentUuid": None, "timestamp": TS,
+                          "sessionId": "sess-1", "agentId": "deep",
+                          "message": {"role": "assistant", "model": "claude-x", "content": [
+                              {"type": "tool_use", "id": "toolu_d", "name": "Bash", "input": "DEEP"}]}})
+        for agent_id in ("a-deep", "z-deep"):
+            path = self.project / "sess-1" / "subagents" / f"agent-{agent_id}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(row.replace('"DEEP"', deep(levels)) + "\n")
+        self.sub("fine")
+        written, printed = self.run_main()
+        self.assertEqual([c["session_id"] for c in written], ["sess-1", "agent-fine"])
+        self.assertEqual(written[0]["subagent_sessions"], ["a-deep", "fine", "z-deep"])
+        # Whether the reader or the writer gave up on a file, the run names it
+        for agent_id in ("a-deep", "z-deep"):
+            self.assertIn(f"agent-{agent_id}.jsonl", printed)
+

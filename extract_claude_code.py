@@ -132,7 +132,8 @@ def _session_files(container):
     <session-id>/subagents/. Returns (session files, [(sub-agent file, parent session id or None)]);
     the parent of a file beside the session files is only known from its entries.
     """
-    sessions = sorted(f for f in container.glob('*.jsonl') if not f.name.startswith('agent-'))
+    # Sessions keep the order the directory lists them in, as they always have
+    sessions = [f for f in container.glob('*.jsonl') if not f.name.startswith('agent-')]
     subagents = [(f, None) for f in sorted(container.glob('agent-*.jsonl'))]
     subagents += [(f, f.relative_to(container).parts[0])
                   for f in sorted(container.glob('*/subagents/**/agent-*.jsonl'))]
@@ -327,7 +328,7 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
 
     if (project_dir / 'projects').exists():
         # New structure: projects/project-name/session.jsonl
-        containers = sorted(proj for proj in (project_dir / 'projects').iterdir() if proj.is_dir())
+        containers = [proj for proj in (project_dir / 'projects').iterdir() if proj.is_dir()]
     else:
         # Old structure: direct JSONL files
         containers = [project_dir]
@@ -391,6 +392,26 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
                 sessions[parent_session]['subagent_sessions'] = sorted(set(agents))
 
     return conversations + (subagent_conversations if include_subagents else [])
+
+
+def _output_line(conversation, encoding):
+    """One conversation as a line of the output file, or None when it cannot be written
+
+    A session is written as it always was, and a failure there still stops the export. A
+    sub-agent conversation must never do that, because the sessions around it were exported
+    before sub-agents were: what the file's encoding cannot hold is escaped, and what is
+    nested too deeply to serialise is left out.
+    """
+    if not conversation.get('subagent'):
+        return json.dumps(conversation, ensure_ascii=False) + '\n'
+    try:
+        line = json.dumps(conversation, ensure_ascii=False) + '\n'
+        line.encode(encoding)
+    except RecursionError:
+        return None
+    except UnicodeEncodeError:
+        line = json.dumps(conversation) + '\n'
+    return line
 
 
 def main():
@@ -465,12 +486,20 @@ def main():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_file = output_dir / f'claude_code_conversations_{timestamp}.jsonl'
 
+    not_written = 0
     with open(output_file, 'w') as f:
         for conv in all_conversations:
-            f.write(json.dumps(conv, ensure_ascii=False) + '\n')
+            line = _output_line(conv, f.encoding)
+            if line is None:
+                not_written += 1
+                print(f"⚠️  Not written, nested too deeply to serialise: {conv['source_file']}")
+                continue
+            f.write(line)
 
     file_size = output_file.stat().st_size / 1024 / 1024
     print(f"✅ Saved to: {output_file}")
+    if not_written:
+        print(f"   Sub-agent sessions not written: {not_written:,}")
     print(f"   Size: {file_size:.2f} MB")
     print(f"   Format: JSONL (one conversation per line)")
 
