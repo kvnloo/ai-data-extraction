@@ -2,6 +2,7 @@
 """
 Extract ALL Claude Code chat data from all projects
 Includes: messages, code context, diffs, file references
+Sub-agent transcripts are exported as conversations of their own
 Auto-discovers Claude Code installations on the device
 """
 
@@ -100,196 +101,269 @@ def _omitted_blocks(content):
                            'encoded_size': len(source.get('data') or '')})
     return blocks
 
-def extract_claude_project_conversations(project_dir):
-    """Extract conversations from a Claude project directory with full context"""
-    conversations = []
+META_FILE_LIMIT = 64 * 1024
+META_FIELDS = {'agentType': 'agent_type', 'description': 'agent_description'}
 
-    # Find all JSONL session files
-    jsonl_files = []
+
+def _agent_meta(agent_file):
+    """What kind of sub-agent this was and what it was asked for, from the small meta file beside its transcript"""
+    meta_file = agent_file.with_name(agent_file.stem + '.meta.json')
+    try:
+        if not meta_file.is_file() or meta_file.stat().st_size > META_FILE_LIMIT:
+            return {}
+        meta = json.loads(meta_file.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(meta, dict):
+        return {}
+    # Only these two fields; the file can hold anything else
+    return {name: meta[key] for key, name in META_FIELDS.items() if isinstance(meta.get(key), str)}
+
+
+def _session_files(container):
+    """Session transcripts in a directory, and the sub-agent transcripts that belong to them
+
+    A sub-agent transcript is agent-<id>.jsonl, either beside the session files or under
+    <session-id>/subagents/. Returns (session files, [(sub-agent file, parent session id or None)]);
+    the parent of a file beside the session files is only known from its entries.
+    """
+    sessions = sorted(f for f in container.glob('*.jsonl') if not f.name.startswith('agent-'))
+    subagents = [(f, None) for f in sorted(container.glob('agent-*.jsonl'))]
+    subagents += [(f, f.relative_to(container).parts[0])
+                  for f in sorted(container.glob('*/subagents/**/agent-*.jsonl'))]
+    return sessions, [(f, parent) for f, parent in subagents if f.is_file()]
+
+
+def _convert_session_file(jsonl_file, project_dir, project_name):
+    """Convert one transcript, a session's or a sub-agent's, into a conversation
+
+    Returns (conversation or None, the session id its entries name).
+    """
+    messages = []
+    omitted_attachments = {}
+    omitted_entries = {}
+    skipped_lines = 0
+    session_id = jsonl_file.stem
+    project_path = None
+    entry_session_id = None
+
+    with open(jsonl_file, 'r') as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            exported = len(messages)
+            try:
+                obj = json.loads(line)
+                msg_type = obj.get('type')
+                if entry_session_id is None and obj.get('sessionId'):
+                    entry_session_id = obj['sessionId']
+
+                if msg_type == 'user':
+                    message = obj.get('message', {})
+                    content = message.get('content', '')
+
+                    # Tool output is stored as a user entry; it is not something the user said
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get('type') == 'tool_result':
+                                tool_msg = {
+                                    'role': 'tool',
+                                    'tool_call_id': item.get('tool_use_id'),
+                                    'content': _block_text(item.get('content')),
+                                    'is_error': bool(item.get('is_error')),
+                                    'timestamp': obj.get('timestamp'),
+                                    **_identity(obj)
+                                }
+                                omitted = _omitted_blocks(item.get('content'))
+                                if omitted:
+                                    tool_msg['omitted_content'] = omitted
+                                messages.append(tool_msg)
+                        content = [item for item in content
+                                   if not (isinstance(item, dict) and item.get('type') == 'tool_result')]
+
+                    if content:
+                        msg = {
+                            'role': 'user',
+                            'content': content,
+                            'timestamp': obj.get('timestamp'),
+                            **_identity(obj)
+                        }
+
+                        # Extract tool use (code context, diffs, etc.)
+                        if 'toolUse' in obj:
+                            msg['tool_use'] = obj['toolUse']
+
+                        messages.append(msg)
+
+                    # Extract working directory
+                    if 'cwd' in obj:
+                        project_path = obj['cwd']
+
+                elif msg_type == 'assistant':
+                    message = obj.get('message', {})
+                    content = message.get('content', [])
+
+                    # Extract text from content array
+                    text_parts = []
+                    code_blocks = []
+                    tool_uses = []
+                    thinking = []
+
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                if item.get('type') == 'text':
+                                    text_parts.append(item.get('text', ''))
+                                elif item.get('type') == 'thinking' and item.get('thinking'):
+                                    thinking.append(item['thinking'])
+                                elif item.get('type') == 'tool_use':
+                                    # Code execution, file edits, etc.
+                                    tool_uses.append(item)
+                    elif isinstance(content, str):
+                        text_parts.append(content)
+
+                    full_text = '\n'.join(text_parts)
+                    if full_text or tool_uses or thinking:
+                        msg = {
+                            'role': 'assistant',
+                            'content': full_text,
+                            'model': message.get('model'),
+                            'timestamp': obj.get('timestamp'),
+                            **_identity(obj)
+                        }
+
+                        # One response can be written as several entries that repeat the
+                        # same usage; message_id lets a consumer count it once
+                        if message.get('id'):
+                            msg['message_id'] = message['id']
+                        if obj.get('requestId'):
+                            msg['request_id'] = obj['requestId']
+                        usage = message.get('usage')
+                        if isinstance(usage, dict):
+                            msg['usage'] = dict(usage)
+
+                        if thinking:
+                            msg['reasoning'] = '\n'.join(thinking)
+
+                        if tool_uses:
+                            msg['tool_uses'] = tool_uses
+
+                        messages.append(msg)
+
+                elif msg_type == 'attachment':
+                    # Context a hook added is something the model read but the user never typed
+                    attachment = obj.get('attachment') or {}
+                    if attachment.get('type') == 'hook_additional_context':
+                        messages.append({
+                            'role': 'system',
+                            'content': _block_text(attachment.get('content')),
+                            'timestamp': obj.get('timestamp'),
+                            'custom': True,
+                            'custom_type': 'hook_additional_context',
+                            'hook_event': attachment.get('hookEvent'),
+                            **_identity(obj)
+                        })
+                    else:
+                        # Not conversation, but say what was left out
+                        kind = attachment.get('type') or 'unknown'
+                        omitted_attachments[kind] = omitted_attachments.get(kind, 0) + 1
+
+                elif msg_type == 'tool_result':
+                    # Capture tool results (diffs, file reads, etc.)
+                    tool_result = obj.get('toolResult', {})
+                    if tool_result and messages:
+                        # Add to last assistant message
+                        if 'tool_results' not in messages[-1]:
+                            messages[-1]['tool_results'] = []
+                        messages[-1]['tool_results'].append(tool_result)
+
+                if len(messages) == exported and obj.get('uuid'):
+                    # Nothing was exported for this entry; keep its link so a parent_id
+                    # that names it can still be followed
+                    omitted = {'type': msg_type, 'parent_id': obj.get('parentUuid')}
+                    if obj.get('logicalParentUuid'):
+                        omitted['logical_parent_id'] = obj['logicalParentUuid']
+                    omitted_entries[obj['uuid']] = omitted
+
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                # A line that is not a well-formed entry costs that line, not the session
+                del messages[exported:]
+                skipped_lines += 1
+                continue
+
+    if not messages:
+        return None, entry_session_id
+
+    return {
+        'messages': messages,
+        'source': 'claude-code',
+        'session_id': session_id,
+        'project_path': project_path,
+        'project_name': project_name,
+        'omitted_attachments': omitted_attachments,
+        'omitted_entries': omitted_entries,
+        'skipped_lines': skipped_lines,
+        'source_file': str(jsonl_file),
+        'installation': str(project_dir)
+    }, entry_session_id
+
+
+def extract_claude_project_conversations(project_dir, include_subagents=True):
+    """Extract conversations from a Claude project directory with full context
+
+    A sub-agent's transcript is exported as a conversation of its own, marked 'subagent' and
+    linked to its session by 'parent_session'; the session lists its sub-agents in
+    'subagent_sessions' whether or not they are exported.
+    """
+    project_dir = Path(project_dir)
+    conversations = []
+    subagent_conversations = []
+
     if (project_dir / 'projects').exists():
         # New structure: projects/project-name/session.jsonl
-        for proj in (project_dir / 'projects').iterdir():
-            if proj.is_dir():
-                jsonl_files.extend(list(proj.glob('*.jsonl')))
+        containers = sorted(proj for proj in (project_dir / 'projects').iterdir() if proj.is_dir())
     else:
         # Old structure: direct JSONL files
-        jsonl_files = list(project_dir.glob('*.jsonl'))
+        containers = [project_dir]
 
-    # Filter out agent files
-    jsonl_files = [f for f in jsonl_files if not f.name.startswith('agent-')]
-
-    for jsonl_file in jsonl_files:
+    def convert(jsonl_file, project_name):
         try:
-            messages = []
-            omitted_attachments = {}
-            omitted_entries = {}
-            skipped_lines = 0
-            session_id = jsonl_file.stem
-            project_path = None
-            project_name = jsonl_file.parent.name if jsonl_file.parent.name != 'projects' else None
-
-            with open(jsonl_file, 'r') as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-
-                    exported = len(messages)
-                    try:
-                        obj = json.loads(line)
-                        msg_type = obj.get('type')
-
-                        if msg_type == 'user':
-                            message = obj.get('message', {})
-                            content = message.get('content', '')
-
-                            # Tool output is stored as a user entry; it is not something the user said
-                            if isinstance(content, list):
-                                for item in content:
-                                    if isinstance(item, dict) and item.get('type') == 'tool_result':
-                                        tool_msg = {
-                                            'role': 'tool',
-                                            'tool_call_id': item.get('tool_use_id'),
-                                            'content': _block_text(item.get('content')),
-                                            'is_error': bool(item.get('is_error')),
-                                            'timestamp': obj.get('timestamp'),
-                                            **_identity(obj)
-                                        }
-                                        omitted = _omitted_blocks(item.get('content'))
-                                        if omitted:
-                                            tool_msg['omitted_content'] = omitted
-                                        messages.append(tool_msg)
-                                content = [item for item in content
-                                           if not (isinstance(item, dict) and item.get('type') == 'tool_result')]
-
-                            if content:
-                                msg = {
-                                    'role': 'user',
-                                    'content': content,
-                                    'timestamp': obj.get('timestamp'),
-                                    **_identity(obj)
-                                }
-
-                                # Extract tool use (code context, diffs, etc.)
-                                if 'toolUse' in obj:
-                                    msg['tool_use'] = obj['toolUse']
-
-                                messages.append(msg)
-
-                            # Extract working directory
-                            if 'cwd' in obj:
-                                project_path = obj['cwd']
-
-                        elif msg_type == 'assistant':
-                            message = obj.get('message', {})
-                            content = message.get('content', [])
-
-                            # Extract text from content array
-                            text_parts = []
-                            code_blocks = []
-                            tool_uses = []
-                            thinking = []
-
-                            if isinstance(content, list):
-                                for item in content:
-                                    if isinstance(item, dict):
-                                        if item.get('type') == 'text':
-                                            text_parts.append(item.get('text', ''))
-                                        elif item.get('type') == 'thinking' and item.get('thinking'):
-                                            thinking.append(item['thinking'])
-                                        elif item.get('type') == 'tool_use':
-                                            # Code execution, file edits, etc.
-                                            tool_uses.append(item)
-                            elif isinstance(content, str):
-                                text_parts.append(content)
-
-                            full_text = '\n'.join(text_parts)
-                            if full_text or tool_uses or thinking:
-                                msg = {
-                                    'role': 'assistant',
-                                    'content': full_text,
-                                    'model': message.get('model'),
-                                    'timestamp': obj.get('timestamp'),
-                                    **_identity(obj)
-                                }
-
-                                # One response can be written as several entries that repeat the
-                                # same usage; message_id lets a consumer count it once
-                                if message.get('id'):
-                                    msg['message_id'] = message['id']
-                                if obj.get('requestId'):
-                                    msg['request_id'] = obj['requestId']
-                                usage = message.get('usage')
-                                if isinstance(usage, dict):
-                                    msg['usage'] = dict(usage)
-
-                                if thinking:
-                                    msg['reasoning'] = '\n'.join(thinking)
-
-                                if tool_uses:
-                                    msg['tool_uses'] = tool_uses
-
-                                messages.append(msg)
-
-                        elif msg_type == 'attachment':
-                            # Context a hook added is something the model read but the user never typed
-                            attachment = obj.get('attachment') or {}
-                            if attachment.get('type') == 'hook_additional_context':
-                                messages.append({
-                                    'role': 'system',
-                                    'content': _block_text(attachment.get('content')),
-                                    'timestamp': obj.get('timestamp'),
-                                    'custom': True,
-                                    'custom_type': 'hook_additional_context',
-                                    'hook_event': attachment.get('hookEvent'),
-                                    **_identity(obj)
-                                })
-                            else:
-                                # Not conversation, but say what was left out
-                                kind = attachment.get('type') or 'unknown'
-                                omitted_attachments[kind] = omitted_attachments.get(kind, 0) + 1
-
-                        elif msg_type == 'tool_result':
-                            # Capture tool results (diffs, file reads, etc.)
-                            tool_result = obj.get('toolResult', {})
-                            if tool_result and messages:
-                                # Add to last assistant message
-                                if 'tool_results' not in messages[-1]:
-                                    messages[-1]['tool_results'] = []
-                                messages[-1]['tool_results'].append(tool_result)
-
-                        if len(messages) == exported and obj.get('uuid'):
-                            # Nothing was exported for this entry; keep its link so a parent_id
-                            # that names it can still be followed
-                            omitted = {'type': msg_type, 'parent_id': obj.get('parentUuid')}
-                            if obj.get('logicalParentUuid'):
-                                omitted['logical_parent_id'] = obj['logicalParentUuid']
-                            omitted_entries[obj['uuid']] = omitted
-
-                    except (json.JSONDecodeError, AttributeError, TypeError):
-                        # A line that is not a well-formed entry costs that line, not the session
-                        del messages[exported:]
-                        skipped_lines += 1
-                        continue
-
-            if messages:
-                conversations.append({
-                    'messages': messages,
-                    'source': 'claude-code',
-                    'session_id': session_id,
-                    'project_path': project_path,
-                    'project_name': project_name,
-                    'omitted_attachments': omitted_attachments,
-                    'omitted_entries': omitted_entries,
-                    'skipped_lines': skipped_lines,
-                    'source_file': str(jsonl_file),
-                    'installation': str(project_dir)
-                })
-
+            return _convert_session_file(jsonl_file, project_dir, project_name)
         except Exception as e:
             print(f"Error processing {jsonl_file}: {e}")
-            continue
+            return None, None
 
-    return conversations
+    for container in containers:
+        project_name = container.name if container.name != 'projects' else None
+        session_files, subagent_files = _session_files(container)
+
+        sessions = {}
+        for jsonl_file in session_files:
+            conversation, _ = convert(jsonl_file, project_name)
+            if conversation:
+                conversations.append(conversation)
+                sessions[conversation['session_id']] = conversation
+
+        agents_of = {}
+        for agent_file, parent_session in subagent_files:
+            agent = agent_file.stem[len('agent-'):]
+            conversation, entry_session_id = convert(agent_file, project_name)
+            parent_session = parent_session or entry_session_id
+            if parent_session:
+                agents_of.setdefault(parent_session, []).append(agent)
+            if conversation:
+                conversation.update(subagent=True, agent=agent, parent_session=parent_session,
+                                    **_agent_meta(agent_file))
+                subagent_conversations.append(conversation)
+
+        # A sub-agent's usage is not in its session's transcript; say that it exists
+        for parent_session, agents in agents_of.items():
+            if parent_session in sessions:
+                sessions[parent_session]['subagent_sessions'] = sorted(agents)
+
+    return conversations + (subagent_conversations if include_subagents else [])
+
 
 def main():
     print("="*80)
@@ -341,10 +415,12 @@ def main():
     with_tools = sum(1 for c in all_conversations
                      if any('tool_use' in m or 'tool_uses' in m or 'tool_results' in m
                            for m in c['messages']))
+    subagents = sum(1 for c in all_conversations if c.get('subagent'))
     complete = sum(1 for c in all_conversations
                    if any(m['role'] == 'assistant' for m in c['messages']))
 
     print(f"Complete conversations: {complete:,}")
+    print(f"Sub-agent sessions: {subagents:,}")
     print(f"Total messages: {total_messages:,}")
     print(f"With tool use/diffs: {with_tools:,}")
     print()

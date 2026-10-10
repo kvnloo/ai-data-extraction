@@ -241,3 +241,227 @@ class ExtractClaudeCodeProvenanceAuditTests(ExtractClaudeCodeTests):
                 self.assertEqual([[m["id"] for m in c["messages"]] for c in conversations], [["u1", "s1"]])
                 self.assertEqual(conversations[0]["skipped_lines"], 1)
         self.assertEqual(self.conversation(rows)["skipped_lines"], 0)
+
+
+SUB_USAGE = {"input_tokens": 100, "output_tokens": 40, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 9}
+PARENT_USAGE = {"input_tokens": 20, "output_tokens": 6, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}
+
+
+def transcript(prefix, usage, session_id="sess-1", agent_id=None, replies=1):
+    """A synthetic transcript: one prompt, then `replies` responses that each carry `usage` under their own id"""
+    extra = {"sessionId": session_id}
+    if agent_id:
+        extra.update(agentId=agent_id, isSidechain=True)
+    rows = [{"type": "user", "uuid": f"{prefix}-u", "parentUuid": None, "timestamp": TS, "cwd": "/work",
+             "message": {"role": "user", "content": f"{prefix} prompt"}, **extra},
+            {"type": "attachment", "uuid": f"{prefix}-a", "parentUuid": f"{prefix}-u", "timestamp": TS,
+             "attachment": {"type": "date"}, **extra}]
+    parent = f"{prefix}-a"
+    for n in range(replies):
+        rows.append({"type": "assistant", "uuid": f"{prefix}-s{n}", "parentUuid": parent, "timestamp": TS,
+                     "requestId": f"req-{prefix}-{n}",
+                     "message": {"id": f"msg-{prefix}-{n}", "role": "assistant", "model": "claude-x", "usage": usage,
+                                 "content": [{"type": "text", "text": f"{prefix} reply {n}"}]}, **extra})
+        parent = f"{prefix}-s{n}"
+    return rows
+
+
+def write_rows(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+def total_usage(conversations):
+    """Sum usage across conversations, counting each response once"""
+    seen, totals = set(), {}
+    for conversation in conversations:
+        for message in conversation["messages"]:
+            if "usage" in message and message["message_id"] not in seen:
+                seen.add(message["message_id"])
+                for key, value in message["usage"].items():
+                    totals[key] = totals.get(key, 0) + value
+    return totals
+
+
+class ExtractClaudeCodeSubagentTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.project = self.root / "projects" / "-work"
+        self.project.mkdir(parents=True)
+
+    def parent(self, session_id="sess-1"):
+        return write_rows(self.project / f"{session_id}.jsonl", transcript("main", PARENT_USAGE, session_id))
+
+    def nested(self, agent_id, session_id="sess-1", rows=None, meta=None):
+        path = self.project / session_id / "subagents" / f"agent-{agent_id}.jsonl"
+        write_rows(path, transcript(agent_id, SUB_USAGE, session_id, agent_id) if rows is None else rows)
+        if meta is not None:
+            path.with_name(f"agent-{agent_id}.meta.json").write_text(meta if isinstance(meta, str) else json.dumps(meta))
+        return path
+
+    def beside(self, agent_id, session_id="sess-1"):
+        return write_rows(self.project / f"agent-{agent_id}.jsonl", transcript(agent_id, SUB_USAGE, session_id, agent_id))
+
+    def export(self, **kwargs):
+        conversations = extract_claude_project_conversations(self.root, **kwargs)
+        return ([c for c in conversations if not c.get("subagent")],
+                sorted((c for c in conversations if c.get("subagent")), key=lambda c: c["agent"]))
+
+    def test_a_session_without_sub_agents_exports_as_before(self):
+        self.parent()
+        mains, subs = self.export()
+        self.assertEqual(subs, [])
+        self.assertNotIn("subagent", mains[0])
+        self.assertNotIn("parent_session", mains[0])
+        self.assertNotIn("subagent_sessions", mains[0])
+
+    def test_sub_agent_in_the_session_directory_is_its_own_conversation(self):
+        self.parent()
+        path = self.nested("a1b2", meta={"agentType": "Explore", "description": "Find the deploy config",
+                                         "prompt": "do-not-export-this", "worktreePath": "/secret/place"})
+        mains, subs = self.export()
+        self.assertEqual(len(mains), 1)
+        self.assertEqual(len(subs), 1)
+        sub = subs[0]
+        self.assertIs(sub["subagent"], True)
+        self.assertEqual(sub["agent"], "a1b2")
+        self.assertEqual(sub["parent_session"], "sess-1")
+        self.assertEqual(sub["session_id"], "agent-a1b2")
+        self.assertEqual(sub["source"], "claude-code")
+        self.assertEqual(sub["source_file"], str(path))
+        self.assertEqual(sub["project_name"], "-work")
+        self.assertEqual(sub["project_path"], "/work")
+        self.assertEqual(sub["agent_type"], "Explore")
+        self.assertEqual(sub["agent_description"], "Find the deploy config")
+        # Nothing else in the meta file is exported.
+        self.assertNotIn("do-not-export-this", json.dumps(sub))
+        self.assertNotIn("/secret/place", json.dumps(sub))
+        # The parent says sub-agent usage exists, for a consumer that ignores those conversations.
+        self.assertEqual(mains[0]["subagent_sessions"], ["a1b2"])
+
+    def test_sub_agent_goes_through_the_same_conversion_as_a_main_session(self):
+        self.parent()
+        self.nested("a1b2")
+        mains, subs = self.export()
+        sub = subs[0]
+        self.assertEqual(set(sub) - {"subagent", "agent", "parent_session"}, set(mains[0]) - {"subagent_sessions"})
+        self.assertEqual([m["id"] for m in sub["messages"]], ["a1b2-u", "a1b2-s0"])
+        self.assertEqual([m["parent_id"] for m in sub["messages"]], [None, "a1b2-a"])
+        self.assertEqual(sub["messages"][1]["usage"], SUB_USAGE)
+        self.assertEqual(sub["messages"][1]["message_id"], "msg-a1b2-0")
+        self.assertEqual(sub["messages"][1]["request_id"], "req-a1b2-0")
+        self.assertTrue(all(m["is_sidechain"] for m in sub["messages"]))
+        self.assertEqual(sub["omitted_entries"], {"a1b2-a": {"type": "attachment", "parent_id": "a1b2-u"}})
+        self.assertEqual(sub["omitted_attachments"], {"date": 1})
+        self.assertEqual(sub["skipped_lines"], 0)
+
+    def test_sub_agent_beside_the_session_file_takes_its_parent_from_its_entries(self):
+        self.parent()
+        path = self.beside("c3d4")
+        mains, subs = self.export()
+        self.assertEqual(len(mains), 1)  # the agent file is not mistaken for a session of its own
+        self.assertEqual([(s["agent"], s["parent_session"], s["subagent"]) for s in subs], [("c3d4", "sess-1", True)])
+        self.assertEqual(subs[0]["source_file"], str(path))
+        self.assertEqual(subs[0]["project_name"], "-work")
+        self.assertEqual(subs[0]["messages"][1]["usage"], SUB_USAGE)
+        self.assertEqual(mains[0]["subagent_sessions"], ["c3d4"])
+
+    def test_both_layouts_together_and_each_parent_lists_only_its_own(self):
+        self.parent("sess-1")
+        self.parent("sess-2")
+        self.nested("n1", "sess-1")
+        self.nested("n2", "sess-2")
+        self.beside("o1", "sess-1")
+        mains, subs = self.export()
+        self.assertEqual([(s["agent"], s["parent_session"]) for s in subs],
+                         [("n1", "sess-1"), ("n2", "sess-2"), ("o1", "sess-1")])
+        self.assertEqual({m["session_id"]: m["subagent_sessions"] for m in mains},
+                         {"sess-1": ["n1", "o1"], "sess-2": ["n2"]})
+
+    def test_sub_agent_files_deeper_under_subagents_are_found(self):
+        self.parent()
+        deep = self.project / "sess-1" / "subagents" / "group" / "agent-deep.jsonl"
+        write_rows(deep, transcript("deep", SUB_USAGE, "sess-1", "deep"))
+        mains, subs = self.export()
+        self.assertEqual([(s["agent"], s["parent_session"]) for s in subs], [("deep", "sess-1")])
+        self.assertEqual(mains[0]["subagent_sessions"], ["deep"])
+
+    def test_sub_agent_without_its_parent_session_file_is_still_exported(self):
+        self.nested("n1", "gone-1")
+        self.beside("o1", "gone-2")
+        mains, subs = self.export()
+        self.assertEqual(mains, [])
+        self.assertEqual([(s["agent"], s["parent_session"], s["subagent"]) for s in subs],
+                         [("n1", "gone-1", True), ("o1", "gone-2", True)])
+        self.assertEqual(total_usage(subs), {k: 2 * v for k, v in SUB_USAGE.items()})
+
+    def test_usage_of_parent_and_sub_agents_adds_up_to_what_the_fixtures_hold(self):
+        self.parent()
+        self.nested("n1", rows=transcript("n1", SUB_USAGE, "sess-1", "n1", replies=3))
+        self.nested("n2")
+        self.beside("o1")
+        mains, subs = self.export()
+        self.assertEqual(total_usage(mains), PARENT_USAGE)
+        self.assertEqual(total_usage(subs), {k: 5 * v for k, v in SUB_USAGE.items()})
+        expected = {k: PARENT_USAGE[k] + 5 * SUB_USAGE[k] for k in PARENT_USAGE}
+        self.assertEqual(total_usage(mains + subs), expected)
+        self.assertEqual(expected["input_tokens"], 520)
+
+    def test_a_malformed_sub_agent_file_does_not_break_the_parent(self):
+        self.parent()
+        self.nested("good")
+        self.nested("junk", rows=[]).write_text('{"type": "assistant", "mess\nnull\n[1, 2]\nnot json at all\n')
+        self.nested("bytes", rows=[]).write_bytes(b"\xff\xfe\x00\x80 not utf-8 \xc3\x28\n")
+        self.nested("empty", rows=[])
+        (self.project / "agent-oldjunk.jsonl").write_text("{{{{\n")
+        half = self.nested("half")
+        half.write_text(half.read_text() + '{"type": "assistant", "uuid": "x", "message": None\n')
+        mains, subs = self.export()
+        self.assertEqual([[m["id"] for m in c["messages"]] for c in mains], [["main-u", "main-s0"]])
+        self.assertEqual(total_usage(mains), PARENT_USAGE)
+        # Files with nothing readable yield no conversation; a partly readable one keeps what it can.
+        self.assertEqual([s["agent"] for s in subs], ["good", "half"])
+        self.assertEqual(subs[1]["skipped_lines"], 1)
+        self.assertEqual([m["id"] for m in subs[1]["messages"]], ["half-u", "half-s0"])
+        # The parent still names every sub-agent file its directory holds, readable or not.
+        self.assertEqual(mains[0]["subagent_sessions"], ["bytes", "empty", "good", "half", "junk"])
+
+    def test_meta_file_is_only_read_when_it_is_small_json(self):
+        self.parent()
+        self.nested("big", meta=json.dumps({"agentType": "Explore", "description": "x" * 200_000}))
+        self.nested("bad", meta="{not json")
+        self.nested("list", meta=["agentType", "Explore"])
+        self.nested("odd", meta={"agentType": {"nested": "thing"}, "description": "Only a string is exported"})
+        self.nested("none")
+        _, subs = self.export()
+        by_agent = {s["agent"]: s for s in subs}
+        self.assertEqual(sorted(by_agent), ["bad", "big", "list", "none", "odd"])
+        for name in ("big", "bad", "list", "none"):
+            self.assertNotIn("agent_type", by_agent[name])
+            self.assertNotIn("agent_description", by_agent[name])
+        self.assertNotIn("agent_type", by_agent["odd"])
+        self.assertEqual(by_agent["odd"]["agent_description"], "Only a string is exported")
+        # A meta file is never a session.
+        self.assertFalse([s for s in subs if "meta" in s["session_id"]])
+
+    def test_sub_agents_can_be_left_out_but_the_parent_still_says_they_exist(self):
+        self.parent()
+        self.nested("n1")
+        self.beside("o1")
+        mains, subs = self.export(include_subagents=False)
+        self.assertEqual(subs, [])
+        self.assertEqual(mains[0]["subagent_sessions"], ["n1", "o1"])
+
+    def test_sub_agents_are_found_when_given_a_directory_of_session_files(self):
+        # The older calling convention: a directory that holds session files directly, with no projects/ level.
+        self.parent()
+        self.nested("n1")
+        self.beside("o1")
+        conversations = extract_claude_project_conversations(self.project)
+        self.assertEqual(sorted((c.get("agent"), c.get("parent_session")) for c in conversations if c.get("subagent")),
+                         [("n1", "sess-1"), ("o1", "sess-1")])
+        main = next(c for c in conversations if not c.get("subagent"))
+        self.assertEqual(main["subagent_sessions"], ["n1", "o1"])
