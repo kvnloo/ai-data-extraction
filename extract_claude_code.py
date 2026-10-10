@@ -150,9 +150,12 @@ def _omitted_blocks(content):
 STRUCTURED_STRING_LIMIT = 2000   # characters, of a string and of a key
 STRUCTURED_LIST_LIMIT = 100      # items
 STRUCTURED_DEPTH_LIMIT = 32      # containers inside one another
-STRUCTURED_SIZE_LIMIT = 16000    # bytes of JSON, after the limits above
-SUBAGENT_TOTAL_LIMIT = 1000      # bytes of JSON of each total in 'subagent_ref'
-ID_LIMIT = 200                   # characters of an id written outside 'structured'
+# JSON is measured as json.dumps writes it by default, with everything outside ASCII as \u
+# escapes: no line of the output is written in a longer form than that
+STRUCTURED_SIZE_LIMIT = 16000    # characters of JSON, after the limits above
+SUBAGENT_TOTAL_LIMIT = 1000      # characters of JSON of each total in 'subagent_ref'
+STOP_REASON_LIMIT = 200          # characters of JSON of 'stop_reason'
+ID_LIMIT = 200                   # characters of JSON, inside the quotes, of an id written outside 'structured'
 OMITTED_KEY = 'omitted-key-'
 
 
@@ -166,11 +169,11 @@ def _writable(text):
 
 
 def _id(value):
-    """An id as an added field may hold it, UTF-8 text of at most ID_LIMIT characters, else None
+    """An id as an added field may hold it, UTF-8 text of at most ID_LIMIT characters of JSON, else None
 
     An empty id is returned as it is: it is false, like None, so it is never written either.
     """
-    return value if isinstance(value, str) and len(value) <= ID_LIMIT and _writable(value) else None
+    return value if isinstance(value, str) and len(json.dumps(value)) - 2 <= ID_LIMIT and _writable(value) else None
 
 
 def _canonical(value):
@@ -233,8 +236,8 @@ def _structured(value, size_limit=STRUCTURED_SIZE_LIMIT):
     Scalars and small containers are kept as they are. A string over STRUCTURED_STRING_LIMIT
     characters, a list over STRUCTURED_LIST_LIMIT items and image data of any length are
     replaced where they stand by _left_out, as is a value JSON cannot hold (NaN, Infinity,
-    text that is not UTF-8). If what is left is still over `size_limit` bytes, the whole
-    value is replaced. A value nested over STRUCTURED_DEPTH_LIMIT containers deep, or with a
+    text that is not UTF-8). If what is left is still over `size_limit` characters of JSON,
+    the whole value is replaced. A value nested over STRUCTURED_DEPTH_LIMIT containers deep, or with a
     replaced key that another key already is, is replaced whole by
     {'omitted': True, 'kind': 'unserialisable'}.
     """
@@ -242,8 +245,7 @@ def _structured(value, size_limit=STRUCTURED_SIZE_LIMIT):
         bounded = _bounded(value)
     except ValueError:
         return _left_out()
-    size = len(json.dumps(bounded, ensure_ascii=False).encode('utf-8'))
-    return bounded if size <= size_limit else _left_out(value)
+    return bounded if len(json.dumps(bounded)) <= size_limit else _left_out(value)
 
 
 SUBAGENT_TOTALS = {'totalTokens': 'total_tokens', 'usage': 'usage'}
@@ -413,7 +415,7 @@ def _agent_meta(agent_file):
     try:
         if not meta_file.is_file() or meta_file.stat().st_size > META_FILE_LIMIT:
             return {}
-        meta = json.loads(meta_file.read_text())
+        meta = json.loads(meta_file.read_text(encoding='utf-8'))
     except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(meta, dict):
@@ -451,7 +453,7 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
     project_path = None
     entry_session_id = None
 
-    with open(jsonl_file, 'r') as f:
+    with open(jsonl_file, 'r', encoding='utf-8') as f:  # transcripts are UTF-8, whatever the locale is
         for line in f:
             if not line.strip():
                 continue
@@ -560,7 +562,7 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
                         if isinstance(usage, dict):
                             msg['usage'] = dict(usage)
                         if message.get('stop_reason') is not None:
-                            msg['stop_reason'] = _structured(message['stop_reason'])
+                            msg['stop_reason'] = _structured(message['stop_reason'], STOP_REASON_LIMIT)
 
                         if thinking:
                             msg['reasoning'] = '\n'.join(thinking)
@@ -754,7 +756,7 @@ def _output_line(conversation, encoding):
 
     A session is written as it always was, and a failure there still stops the export. A
     sub-agent conversation must never do that, because the sessions around it were exported
-    before sub-agents were: what the file's encoding cannot hold is escaped, and what is
+    before sub-agents were: what the file's encoding (UTF-8) cannot hold is escaped, and what is
     nested too deeply to serialise is left out. Names are not what fails here: _name has
     already made every one of them text, in a session and in a sub-agent alike.
     """
@@ -843,7 +845,7 @@ def main():
     output_file = output_dir / f'claude_code_conversations_{timestamp}.jsonl'
 
     not_written = 0
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:  # JSONL is UTF-8, whatever the locale is
         for conv in all_conversations:
             line = _output_line(conv, f.encoding)
             if line is None:

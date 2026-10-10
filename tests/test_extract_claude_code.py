@@ -2180,8 +2180,8 @@ class SubagentCopyGroupingTests(unittest.TestCase):
 
 
 ADDED_FIELDS = ("structured", "source_assistant_id", "subagent_ref", "stop_reason")
-ID_LIMIT = 200            # characters of an id in source_assistant_id and subagent_ref.agent
-TOTAL_LIMIT = 1000        # bytes of each total in subagent_ref
+ID_LIMIT = 200            # characters of JSON, escaped, of an id in source_assistant_id and subagent_ref.agent
+TOTAL_LIMIT = 1000        # characters of JSON, escaped, of each total in subagent_ref
 GROWTH_LIMIT = 20_000     # bytes the added fields may add to one message
 UNSERIALISABLE = {"omitted": True, "kind": "unserialisable"}
 STRING_LIMIT = extract_claude_code.STRUCTURED_STRING_LIMIT
@@ -2442,8 +2442,9 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
         self.assertEqual(self.structured(["a", "b"]), ["a", "b"])
         self.assertEqual(self.structured(0), 0)
         self.assertIs(self.structured(False), False)
-        # The limit is in characters, and the size is that of the text as it is written
-        self.assertEqual(self.structured("\U0001f600" * STRING_LIMIT), "\U0001f600" * STRING_LIMIT)
+        # The limit is in characters, and the size is that of the text written with \u escapes
+        self.assertEqual(self.structured("\u00e9" * STRING_LIMIT), "\u00e9" * STRING_LIMIT)
+        self.assertEqual(self.structured("\U0001f600" * STRING_LIMIT), marker("\U0001f600" * STRING_LIMIT))
 
     def test_two_exports_of_one_input_agree(self):
         rows = [user("u1", None, "go"), call(), result(toolUseResult=read_result(random.Random(1)) | {"n": [1] * 500})]
@@ -2536,9 +2537,9 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
         self.assertEqual((limit, len(json.dumps(at)), len(json.dumps(over))), (16000, 16000, 16001))
         self.assertEqual(self.structured(at), at)
         self.assertEqual(self.structured(over), marker(over))
-        # The size is in bytes of the text as it is written, not in characters
-        wide, wider = ["\u00e9" * 998] * 8, ["\u00e9" * 998] * 7 + ["\u00e9" * 998 + "x"]
-        self.assertEqual(len(json.dumps(wide, ensure_ascii=False).encode("utf-8")), limit)
+        # The size is that of the text written with \u escapes, not its characters or its UTF-8 bytes
+        wide, wider = ["\u00e9" * 332] * 7 + ["\u00e9" * 332 + "x" * 32], ["\u00e9" * 332] * 7 + ["\u00e9" * 332 + "x" * 33]
+        self.assertEqual(len(json.dumps(wide)), limit)
         self.assertEqual(self.structured(wide), wide)
         self.assertEqual(self.structured(wider), marker(wider))
 
@@ -2596,7 +2597,7 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
     def test_an_id_the_export_adds_is_short_text_or_absent(self):
         self.assertEqual((extract_claude_code.ID_LIMIT, extract_claude_code.SUBAGENT_TOTAL_LIMIT), (ID_LIMIT, TOTAL_LIMIT))
         found = {"stdout": "ok"}
-        longest = "\u00e9" * ID_LIMIT
+        longest = "\u00e9" * (ID_LIMIT // 6) + "ss"  # ID_LIMIT characters once escaped
         tool, = self.tools(call(), result(sourceToolAssistantUUID=longest))
         self.assertEqual(tool["source_assistant_id"], longest)
 
@@ -2619,8 +2620,8 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
         self.assertNotIn("source_assistant_id", tool)
 
     def test_a_launch_reference_names_an_agent_only_by_a_short_text_id(self):
-        tool, = self.tools(call(), result(toolUseResult={"agentId": "\u00e9" * ID_LIMIT, "totalTokens": 5}))
-        self.assertEqual(tool["subagent_ref"], {"agent": "\u00e9" * ID_LIMIT, "total_tokens": 5})
+        tool, = self.tools(call(), result(toolUseResult={"agentId": "\u00e9" * (ID_LIMIT // 6), "totalTokens": 5}))
+        self.assertEqual(tool["subagent_ref"], {"agent": "\u00e9" * (ID_LIMIT // 6), "total_tokens": 5})
 
         over, big = "g" * (ID_LIMIT + 1), "g" * 5_000_000
         cases = {"over the limit": (over, over), "5 MB": (big, marker(big)), "half a pair": ("a\ud800b", UNSERIALISABLE),
@@ -2643,24 +2644,24 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
                          {"agent": "g", "total_tokens": marker(large), "usage": marker(large)})
 
     def test_the_added_fields_of_one_message_stay_under_20_kb_at_their_largest(self):
-        wide = "\U0001f600"  # four bytes of UTF-8 to the character
-        launch = {"agentId": wide * ID_LIMIT, "usage": {"note": "n" * (TOTAL_LIMIT - 12)},
+        wide = "\U0001f600"  # twelve characters of JSON to the character, once escaped
+        launch = {"agentId": wide * (ID_LIMIT // 12), "usage": {"note": "n" * (TOTAL_LIMIT - 12)},
                   "totalTokens": "t" * (TOTAL_LIMIT - 2), "pad": []}
-        size = lambda value: len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        size = lambda value: len(json.dumps(value))  # escaped, the longest form a line is written in
         while size(launch) + STRING_LIMIT + 4 <= extract_claude_code.STRUCTURED_SIZE_LIMIT:
             launch["pad"].append("p" * STRING_LIMIT)
         launch["pad"].append("p" * (extract_claude_code.STRUCTURED_SIZE_LIMIT - size(launch) - 4))
         self.assertEqual(size(launch), extract_claude_code.STRUCTURED_SIZE_LIMIT)
 
         bare, = self.tools(call(), result())
-        tool, = self.tools(call(), result(toolUseResult=launch, sourceToolAssistantUUID=wide * ID_LIMIT))
+        tool, = self.tools(call(), result(toolUseResult=launch, sourceToolAssistantUUID=wide * (ID_LIMIT // 12)))
 
         self.assertEqual(tool["structured"], launch)
-        self.assertEqual(tool["subagent_ref"], {"agent": wide * ID_LIMIT, "total_tokens": launch["totalTokens"],
+        self.assertEqual(tool["subagent_ref"], {"agent": wide * (ID_LIMIT // 12), "total_tokens": launch["totalTokens"],
                                                 "usage": launch["usage"]})
-        self.assertEqual(tool["source_assistant_id"], wide * ID_LIMIT)
+        self.assertEqual(tool["source_assistant_id"], wide * (ID_LIMIT // 12))
         self.assertLess(size(tool) - size(bare), GROWTH_LIMIT)
-        self.assertGreater(size(tool) - size(bare), GROWTH_LIMIT - 1000)
+        self.assertGreater(size(tool) - size(bare), GROWTH_LIMIT - 2000)
 
     def test_a_sub_agent_launch_can_be_reconciled_with_the_sub_agent_conversation(self):
         sub_usage = {"input_tokens": 100, "output_tokens": 40, "cache_creation_input_tokens": 0,
@@ -2839,3 +2840,287 @@ class ExtractClaudeCodeHostileFieldTests(unittest.TestCase):
                     self.assertLessEqual(size(message) - size(was), GROWTH_LIMIT)
         # Every added field was written somewhere, so the limits above were measured on something
         self.assertEqual(set(added), set(ADDED_FIELDS))
+
+
+# The output file is UTF-8 under any locale, and what the tool-result work adds is bounded as
+# escaped JSON, the longest form a line can be written in
+
+import subprocess
+import sys
+
+STOP_REASON_LIMIT = 200   # characters of escaped JSON a stop_reason may take before a marker replaces it
+SCRIPT = Path(extract_claude_code.__file__).resolve()
+ACCENT = "café \U0001f600"
+META_TEXT = "réviseur"
+BANNER = "Searching for Claude Code installations"
+# One of these costs 2, 3 and 4 bytes as UTF-8 but 6, 6 and 12 as \u escapes
+UNITS = {"two bytes": "é", "three bytes": "€", "four bytes": "\U0001f600",
+         "mixed": "é\U0001f600p€"}
+ESCAPED_IN_ASCII = {"a quote": '"', "a backslash": "\\", "a control character": "\x01"}
+C_LOCALE = {"LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+# name -> (the whole environment besides HOME, whether stdout can show the first line main() prints)
+ENVIRONMENTS = {
+    "LANG=C.UTF-8": ({"LANG": "C.UTF-8"}, True),
+    "LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0": (C_LOCALE, False),
+    "LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 PYTHONIOENCODING=utf-8": ({**C_LOCALE, "PYTHONIOENCODING": "utf-8"}, True),
+    "LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 PYTHONIOENCODING=ascii:backslashreplace":
+        ({**C_LOCALE, "PYTHONIOENCODING": "ascii:backslashreplace"}, True),
+    "PYTHONIOENCODING=ascii": ({"PYTHONIOENCODING": "ascii"}, False),
+    "PYTHONIOENCODING=latin-1": ({"PYTHONIOENCODING": "latin-1"}, False),
+}
+
+
+def escaped(value):
+    """Characters of a value's JSON with everything outside ASCII written as \\u escapes"""
+    return len(json.dumps(value))
+
+
+def utf8(value):
+    """Bytes of a value's JSON written as UTF-8"""
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+
+
+def sized(unit, size, measure=escaped):
+    """Text of `unit` repeated, filled up with "p", whose JSON measures exactly `size`"""
+    each = measure(unit) - 2
+    return unit * ((size - 2) // each) + "p" * ((size - 2) % each)
+
+
+def padded(value, unit, size, measure=escaped):
+    """`value`, an object, with texts of `unit` under "pad" so that its JSON measures exactly `size`"""
+    value = {**value, "pad": []}
+    each = measure(unit) - 2
+    while size - measure(value) > 8 + each:
+        value["pad"].append(unit * min((size - measure(value) - 8) // each, 400 // len(unit)))
+    value["pad"].append("p" * (size - measure(value) - (4 if value["pad"] else 2)))
+    assert measure(value) == size and len(value["pad"]) <= LIST_LIMIT, (measure(value), size)
+    return value
+
+
+def widest_launch(unit, size, measure=escaped, agent=None):
+    """A sub-agent launch result of `size` whose id and totals are each as long as `measure` lets them be"""
+    return padded({"agentId": agent or sized(unit, ID_LIMIT + 2, measure),
+                   "totalTokens": sized(unit, TOTAL_LIMIT, measure),
+                   "usage": {"n": sized(unit, TOTAL_LIMIT - 7, measure)}}, unit, size, measure)
+
+
+def worst_cases():
+    """name -> entries whose added fields are as long as the export keeps, one character longer,
+    and as long as it kept while it measured UTF-8 bytes and counted an id's characters"""
+    cases = {}
+    for name, unit in {**UNITS, "ASCII": "a"}.items():
+        old_id = (unit * ID_LIMIT)[:ID_LIMIT]
+        for which, launch, caller, stop in (
+                ("at the limits", widest_launch(unit, 16000), sized(unit, ID_LIMIT + 2),
+                 sized(unit, STOP_REASON_LIMIT)),
+                ("one over", widest_launch(unit, 16001), sized(unit, ID_LIMIT + 3),
+                 sized(unit, STOP_REASON_LIMIT + 1)),
+                ("at the limits in UTF-8", widest_launch(unit, 16000, utf8, old_id), old_id,
+                 padded({}, unit, 16000, utf8))):
+            cases[f"{name}, {which}"] = [user("u1", None, "go", sessionId="sess-1"), call(stop_reason=stop),
+                                         result(toolUseResult=launch, sourceToolAssistantUUID=caller)]
+    return cases
+
+
+def stripped(rows):
+    """The same entries without anything the tool-result work reads"""
+    rows = json.loads(json.dumps(rows))
+    for row in rows:
+        row.pop("toolUseResult", None)
+        row.pop("sourceToolAssistantUUID", None)
+        row["message"].pop("stop_reason", None)
+    return rows
+
+
+def half_a_pair(rows):
+    """The same entries after a prompt that is not UTF-8, which only a sub-agent may hold: it is written escaped"""
+    rows = json.loads(json.dumps(rows))
+    rows[0]["message"]["content"] = "go \ud800"
+    return rows
+
+
+def lay_out_worst_cases(projects):
+    """Each worst case as a session and, not UTF-8, as its sub-agent, under -rich; without the new fields under -bare"""
+    for number, rows in enumerate(worst_cases().values()):
+        for project, session in (("-rich", rows), ("-bare", stripped(rows))):
+            write_rows(projects / project / f"s{number}.jsonl", session)
+            write_rows(projects / project / f"s{number}" / "subagents" / f"agent-a{number}.jsonl",
+                       half_a_pair(session))
+
+
+def written_size(line):
+    """How a message of this output line was measured when written: escaped, or as UTF-8"""
+    return escaped if line.isascii() and b"\\ud800" in line else utf8
+
+
+def encoding_sessions():
+    """name -> a session with ACCENT in one exported place: its entries ('rows'), its sub-agent's ('sub'),
+    whether the transcripts hold UTF-8 bytes and not \\u escapes ('raw'), and where the text is exported"""
+    go = user("u1", None, "go", sessionId="sess-1")
+    said = [user("u1", None, ACCENT, sessionId="sess-1"), assistant("s1", "u1", [{"type": "text", "text": ACCENT}])]
+    plain = [go, assistant("s1", "u1", [{"type": "text", "text": "done"}])]
+    tool = lambda found: next(m for m in found[0]["messages"] if m["role"] == "tool")
+    first = lambda found: found[0]["messages"][0]["content"]
+    in_sub = lambda found: next(c for c in found if c.get("subagent"))["messages"][0]["content"]
+    return {
+        "a field exported before, escaped in the transcript": {"rows": said, "where": first},
+        "a field exported before, as UTF-8 in the transcript": {"rows": said, "raw": True, "where": first},
+        "structured": {"rows": [go, call(), result(toolUseResult={"stdout": ACCENT})],
+                       "where": lambda found: tool(found)["structured"]["stdout"]},
+        "stop_reason": {"rows": [go, call(stop_reason=ACCENT)],
+                        "where": lambda found: found[0]["messages"][1]["stop_reason"]},
+        "source_assistant_id": {"rows": [go, call(), result(sourceToolAssistantUUID=ACCENT)],
+                                "where": lambda found: tool(found)["source_assistant_id"]},
+        "subagent_ref": {"rows": [go, call(), result(toolUseResult={"agentId": ACCENT, "totalTokens": 5})],
+                         "where": lambda found: tool(found)["subagent_ref"]["agent"]},
+        "a sub-agent, escaped in the transcript": {"rows": plain, "sub": said, "where": in_sub},
+        "a sub-agent and its meta file, as UTF-8": {"rows": plain, "sub": said, "raw": True, "where": in_sub},
+    }
+
+
+def lay_out(root, session):
+    """A synthetic home under `root` with the one session and its sub-agent; returns the home"""
+    project = root / "home" / ".claude" / "projects" / "-work"
+    as_bytes = lambda value: (json.dumps(value, ensure_ascii=not session.get("raw")) + "\n").encode("utf-8")
+    files = {project / "sess-1.jsonl": b"".join(map(as_bytes, session["rows"]))}
+    if session.get("sub"):
+        agent = project / "sess-1" / "subagents" / "agent-a1.jsonl"
+        files[agent] = b"".join(map(as_bytes, session["sub"]))
+        files[agent.with_name("agent-a1.meta.json")] = as_bytes({"agentType": META_TEXT, "description": META_TEXT})
+    for path, data in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return root / "home"
+
+
+def export_under(script, home, out, environment, python=sys.executable):
+    """Run the export as a program in the new directory `out`, with nothing in its environment but
+    `environment` and the home; returns (exit status, what it wrote to stderr, the output file's bytes or None)"""
+    out.mkdir(parents=True)
+    done = subprocess.run([python, "-s", "-B", str(script)], cwd=out, capture_output=True,
+                          env={"HOME": str(home), **environment})
+    files = list(out.glob("extracted_data/*.jsonl"))
+    return done.returncode, done.stderr.decode("utf-8", "replace"), files[0].read_bytes() if files else None
+
+
+class ExtractClaudeCodeOutputEncodingTests(unittest.TestCase):
+    """The script itself where the locale or stdout is not UTF-8: the output file is UTF-8 all the same"""
+
+    def test_the_output_file_is_complete_utf8_whatever_the_locale_and_stdout_are(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for number, (name, session) in enumerate(encoding_sessions().items()):
+            home = lay_out(Path(tmp.name) / str(number), session)
+            for run, (environment, (variables, shows_banner)) in enumerate(ENVIRONMENTS.items()):
+                with self.subTest(session=name, environment=environment):
+                    status, stderr, data = export_under(SCRIPT, home, home.parent / f"out{run}", variables)
+                    if status and not shows_banner:
+                        # stdout cannot show the first line main() prints, as before; nothing is half written
+                        self.assertIsNone(data)
+                        self.assertIn(BANNER, stderr)
+                        continue
+                    self.assertEqual(status, 0, stderr)
+                    self.assertTrue(data.endswith(b"\n"))
+                    found = [json.loads(line) for line in data.decode("utf-8").split("\n")[:-1]]
+                    self.assertEqual(len(found), 2 if session.get("sub") else 1)
+                    self.assertEqual(session["where"](found), ACCENT)
+                    self.assertIn(ACCENT.encode("utf-8"), data)  # as itself, not as an escape
+                    if session.get("sub"):
+                        self.assertIn(META_TEXT.encode("utf-8"), data)
+
+
+class ExtractClaudeCodeEscapedBoundTests(unittest.TestCase):
+    """The limits on the added fields count \\u escapes, so they hold for a line written escaped too"""
+
+    setUp = ExtractClaudeCodeToolResultTests.setUp
+    export = ExtractClaudeCodeToolResultTests.export
+    tools = ExtractClaudeCodeToolResultTests.tools
+    structured = ExtractClaudeCodeToolResultTests.structured
+
+    def stop_reason(self, value):
+        return self.export([user("u1", None, "go"), call(stop_reason=value)])[0]["messages"][1]["stop_reason"]
+
+    def test_a_structured_result_is_kept_up_to_the_limit_of_its_escaped_json(self):
+        limit = extract_claude_code.STRUCTURED_SIZE_LIMIT
+        for name, unit in UNITS.items():
+            with self.subTest(name):
+                kept, over = padded({"stdout": "ok"}, unit, limit), padded({"stdout": "ok"}, unit, limit + 1)
+                self.assertEqual(self.structured(kept), kept)
+                self.assertLess(utf8(over), limit)  # as UTF-8 it is far under the limit
+                self.assertEqual(self.structured(over), marker(over))
+
+    def test_an_id_is_kept_while_its_escaped_json_is_within_the_limit(self):
+        for name, unit in {**UNITS, **ESCAPED_IN_ASCII}.items():
+            with self.subTest(name):
+                longest, over = sized(unit, ID_LIMIT + 2), sized(unit, ID_LIMIT + 3)
+                self.assertLess(len(over), ID_LIMIT)  # in characters it is under the limit
+                tool, = self.tools(call(), result(toolUseResult={"agentId": longest, "totalTokens": 5},
+                                                  sourceToolAssistantUUID=longest))
+                self.assertEqual((tool["source_assistant_id"], tool["subagent_ref"]["agent"]), (longest, longest))
+                tool, = self.tools(call(), result(toolUseResult={"agentId": over, "totalTokens": 5},
+                                                  sourceToolAssistantUUID=over))
+                self.assertNotIn("source_assistant_id", tool)
+                self.assertNotIn("subagent_ref", tool)
+                tool, = self.tools(call(uuid=longest), result(parent=longest, toolUseResult={"stdout": "ok"}))
+                self.assertEqual(tool["source_assistant_id"], longest)
+                tool, = self.tools(call(uuid=over), result(parent=over, toolUseResult={"stdout": "ok"}))
+                self.assertNotIn("source_assistant_id", tool)
+
+    def test_a_total_is_kept_while_its_escaped_json_is_within_the_limit(self):
+        for name, unit in UNITS.items():
+            with self.subTest(name):
+                kept, over = sized(unit, TOTAL_LIMIT), sized(unit, TOTAL_LIMIT + 1)
+                self.assertLess(utf8(over), TOTAL_LIMIT)
+                tool, = self.tools(call(), result(toolUseResult={"agentId": "g", "totalTokens": kept,
+                                                                 "usage": {"n": over}}))
+                self.assertEqual(tool["subagent_ref"],
+                                 {"agent": "g", "total_tokens": kept, "usage": marker({"n": over})})
+
+    def test_a_stop_reason_is_kept_while_short_and_replaced_by_a_marker_when_not(self):
+        self.assertEqual(extract_claude_code.STOP_REASON_LIMIT, STOP_REASON_LIMIT)
+        for value in ("end_turn", "tool_use", "", 7, True, {"type": "refusal"}, ["a"], "s" * (STOP_REASON_LIMIT - 2)):
+            with self.subTest(value=value):
+                self.assertEqual(self.stop_reason(value), value)
+        for value in ("s" * (STOP_REASON_LIMIT - 1), {"reasons": ["r" * 150, "s" * 150]}, ["r"] * 99):
+            with self.subTest(value=value):
+                self.assertEqual(self.stop_reason(value), marker(value))
+        for name, unit in UNITS.items():
+            with self.subTest(name):
+                longest, over = sized(unit, STOP_REASON_LIMIT), sized(unit, STOP_REASON_LIMIT + 1)
+                self.assertLess(utf8(over), STOP_REASON_LIMIT)
+                self.assertEqual(self.stop_reason(longest), longest)
+                self.assertEqual(self.stop_reason(over), marker(over))
+
+
+class ExtractClaudeCodeEscapedGrowthTests(unittest.TestCase):
+    """main() over the largest values each added field can hold, written as UTF-8 and written escaped"""
+
+    run_main = ExtractClaudeCodeWholeExportTests.run_main
+    written = ExtractClaudeCodeWholeExportTests.written
+    setUp = ExtractClaudeCodeHostileFieldTests.setUp
+
+    def test_no_message_grows_by_more_than_20_kb_as_utf8_or_as_escapes(self):
+        lay_out_worst_cases(self.projects)
+        self.run_main()
+
+        output, = (self.out / "extracted_data").glob("claude_code_conversations_*.jsonl")
+        lines = {json.loads(line)["source_file"]: line for line in output.read_bytes().splitlines()}
+        self.assertEqual(len(lines), 4 * len(worst_cases()))
+        largest = Counter()
+        for source_file, line in lines.items():
+            if "/-rich/" not in source_file:
+                continue
+            was_line = lines[source_file.replace("/-rich/", "/-bare/")]
+            after, before = json.loads(line), json.loads(was_line)
+            path = written_size(line)
+            self.assertIs(written_size(was_line), path)
+            self.assertIs(path, escaped if "/subagents/" in source_file else utf8)
+            with self.subTest(file=source_file):
+                self.assertEqual(without_added([after], also=["dedupe_key"])[0]["messages"],
+                                 without_added([before], also=["dedupe_key"])[0]["messages"])
+                for message, was in zip(after["messages"], before["messages"]):
+                    for measure in (escaped, utf8):
+                        self.assertLessEqual(measure(message) - measure(was), GROWTH_LIMIT)
+                    largest[path.__name__] = max(largest[path.__name__], path(message) - path(was))
+        # The bound was measured on something close to it, on both paths
+        self.assertGreater(min(largest["escaped"], largest["utf8"]), 18_000)
