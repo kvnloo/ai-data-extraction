@@ -754,13 +754,15 @@ class ExtractClaudeCodeWholeExportTests(unittest.TestCase):
         text = next((self.out / "extracted_data").glob("*.jsonl")).read_text(encoding="utf-8")
         self.assertIn("café", text)
 
-    def test_a_session_that_cannot_be_encoded_still_stops_the_export(self):
-        # Unchanged from before sub-agents were exported: a session is never dropped or rewritten quietly
+    def test_a_session_that_cannot_be_encoded_is_written_escaped(self):
+        # It used to stop the export there, and every conversation after it was lost with it
         rows = transcript("main", PARENT_USAGE, "sess-1")
         rows[0]["message"]["content"] = SURROGATE
         write_rows(self.project / "sess-1.jsonl", rows)
-        with self.assertRaises(UnicodeEncodeError):
-            self.run_main()
+        self.sub("fine")
+        written, _ = self.run_main()
+        self.assertEqual([c["session_id"] for c in written], ["sess-1", "agent-fine"])
+        self.assertEqual(written[0]["messages"][0]["content"], SURROGATE)
 
     def test_a_sub_agent_that_cannot_be_serialised_costs_only_itself(self):
         self.sub("a")
@@ -2858,7 +2860,8 @@ UNITS = {"two bytes": "é", "three bytes": "€", "four bytes": "\U0001f600",
          "mixed": "é\U0001f600p€"}
 ESCAPED_IN_ASCII = {"a quote": '"', "a backslash": "\\", "a control character": "\x01"}
 C_LOCALE = {"LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
-# name -> (the whole environment besides HOME, whether stdout can show the first line main() prints)
+# name -> (the whole environment besides HOME, whether stdout can show the first line main() prints;
+# where it cannot, the line is printed escaped and the export goes on: ExtractClaudeCodeExportStopsTests)
 ENVIRONMENTS = {
     "LANG=C.UTF-8": ({"LANG": "C.UTF-8"}, True),
     "LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0": (C_LOCALE, False),
@@ -3014,11 +3017,6 @@ class ExtractClaudeCodeOutputEncodingTests(unittest.TestCase):
             for run, (environment, (variables, shows_banner)) in enumerate(ENVIRONMENTS.items()):
                 with self.subTest(session=name, environment=environment):
                     status, stderr, data = export_under(SCRIPT, home, home.parent / f"out{run}", variables)
-                    if status and not shows_banner:
-                        # stdout cannot show the first line main() prints, as before; nothing is half written
-                        self.assertIsNone(data)
-                        self.assertIn(BANNER, stderr)
-                        continue
                     self.assertEqual(status, 0, stderr)
                     self.assertTrue(data.endswith(b"\n"))
                     found = [json.loads(line) for line in data.decode("utf-8").split("\n")[:-1]]
@@ -3131,3 +3129,143 @@ class ExtractClaudeCodeEscapedGrowthTests(unittest.TestCase):
             with mock.patch.object(extract_claude_code.json, "dumps", side_effect=AssertionError("written out")):
                 self.assertIsNone(extract_claude_code._id(value))
         self.assertEqual(extract_claude_code._id("x" * extract_claude_code.ID_LIMIT), "x" * extract_claude_code.ID_LIMIT)
+
+
+import contextlib
+import io
+import re
+
+LONE = "\ud800"  # half of a surrogate pair: JSON can say it, UTF-8 cannot hold it
+# name -> (the whole environment besides HOME, what stdout is written in): none can show the banner's emoji
+STRICT_STDOUT = {
+    "LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0": (C_LOCALE, "ascii"),
+    "PYTHONIOENCODING=ascii": ({"PYTHONIOENCODING": "ascii"}, "ascii"),
+    "PYTHONIOENCODING=latin-1": ({"PYTHONIOENCODING": "latin-1"}, "latin-1"),
+    "PYTHONIOENCODING=cp1252": ({"PYTHONIOENCODING": "cp1252"}, "cp1252"),
+}
+# the field of a transcript entry -> the field of the exported message that holds it as it is
+EXPORTED_AS_IT_IS = {"uuid": "id", "parentUuid": "parent_id", "timestamp": "timestamp"}
+
+
+class ExtractClaudeCodeExportStopsTests(unittest.TestCase):
+    """Neither a terminal that cannot show a line nor a session that is not text stops the whole export"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.home = self.root / "home"
+        self.project = self.home / ".claude" / "projects" / "-work"
+        self.home.mkdir()
+        self.runs = 0
+
+    def session(self, session_id, **changed):
+        rows = transcript(session_id, PARENT_USAGE, session_id)
+        rows[0]["message"]["content"] = ACCENT
+        rows[0].update(changed)
+        return write_rows(self.project / f"{session_id}.jsonl", rows)
+
+    def program(self, **environment):
+        """The script run as a program with nothing in its environment but `environment` and the home;
+        returns (exit status, what it printed as bytes, what it wrote to stderr, the output file's bytes or None)"""
+        self.runs += 1
+        out = self.root / f"out{self.runs}"
+        out.mkdir()
+        done = subprocess.run([sys.executable, "-s", "-B", str(SCRIPT)], cwd=out, capture_output=True,
+                              env={"HOME": str(self.home), **environment})
+        files = list(out.glob("extracted_data/*.jsonl"))
+        return (done.returncode, done.stdout, done.stderr.decode("utf-8", "replace"),
+                files[0].read_bytes() if files else None)
+
+    def printed_to_ascii(self):
+        """main() here, printing to a terminal that takes ASCII only; returns what it printed"""
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+        out = self.root / "out"
+        out.mkdir(exist_ok=True)
+        cwd = os.getcwd()
+        os.chdir(out)
+        try:
+            # Only the synthetic home is visible: no configured directory, no real one
+            with mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=True), contextlib.redirect_stdout(stream):
+                extract_claude_code.main()
+        finally:
+            os.chdir(cwd)
+        return raw.getvalue().decode("ascii")
+
+    def test_the_export_is_the_same_file_whatever_stdout_can_show(self):
+        self.session("sess-1")
+        self.session("sess-2")
+        stamp = lambda printed: re.sub(r"conversations_\d{8}_\d{6}", "conversations_STAMP", printed)
+        status, shown, stderr, expected = self.program(LANG="C.UTF-8")
+        self.assertEqual((status, stderr), (0, ""))
+        shown = shown.decode("utf-8")
+        self.assertIn("\U0001f50d " + BANNER, shown)  # as itself where it can be shown
+        self.assertEqual(expected.count(b"\n"), 2)
+        for name, (variables, codec) in STRICT_STDOUT.items():
+            with self.subTest(name):
+                status, printed, stderr, data = self.program(**variables)
+                self.assertEqual((status, stderr), (0, ""))
+                self.assertEqual(data, expected)
+                # Every line is printed, and only what this stdout cannot show is escaped
+                self.assertEqual(stamp(printed.decode(codec)),
+                                 stamp(shown).encode(codec, "backslashreplace").decode(codec))
+                self.assertIn("\\U0001f50d " + BANNER, printed.decode(codec))
+
+    def test_no_installation_is_said_on_an_ascii_terminal(self):
+        self.assertIn("\\u274c No Claude Code installations found!\n", self.printed_to_ascii())
+
+    def test_an_installation_with_no_conversations_is_said_on_an_ascii_terminal(self):
+        self.project.mkdir(parents=True)
+        printed = self.printed_to_ascii()
+        self.assertIn("\\u2705 Found 1 installation(s):\n", printed)
+        self.assertIn("   \\u26a0\\ufe0f  No conversations found\n", printed)
+        self.assertTrue(printed.endswith("No conversations found!\n"))
+
+    def test_every_line_of_a_complete_run_is_printed_on_an_ascii_terminal(self):
+        self.session("sess-1")
+        write_rows(self.project / "sess-1" / "subagents" / "agent-a.jsonl", transcript("a", SUB_USAGE, "sess-1", "a"))
+        real_dumps = json.dumps
+
+        def dumps(value, **kwargs):
+            # Stands in for nesting too deep to serialise, which no fixture reaches on every interpreter
+            if isinstance(value, dict) and value.get("agent") == "a":
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_dumps(value, **kwargs)
+
+        with mock.patch.object(extract_claude_code.json, "dumps", dumps):
+            printed = self.printed_to_ascii()
+        for line in ("\\U0001f50d " + BANNER + "...\n", "\\u2705 Found 1 installation(s):\n",
+                     f"\\U0001f4c2 Processing: {self.home / '.claude'}\n", "   \\u2705 2 conversations\n",
+                     "\\u26a0\\ufe0f  Not written, nested too deeply to serialise: ",
+                     "\\u2705 Saved to: extracted_data", "   Sub-agent sessions not written: 1\n",
+                     "   Format: JSONL (one conversation per line)\n"):
+            self.assertIn(line, printed)
+        self.assertEqual(len(list((self.root / "out" / "extracted_data").glob("*.jsonl"))), 1)
+
+    def test_a_session_with_an_id_that_is_not_text_costs_no_other_conversation(self):
+        self.session("sess-a")
+        self.session("sess-z")
+        status, _, stderr, expected = self.program(LANG="C.UTF-8")
+        self.assertEqual((status, stderr), (0, ""))
+        for field in EXPORTED_AS_IT_IS:
+            self.session(f"sess-m-{field}", **{field: LONE})
+        status, _, stderr, data = self.program(LANG="C.UTF-8")
+        self.assertEqual((status, stderr), (0, ""))
+        lines = {json.loads(line)["session_id"]: line for line in data.decode("ascii", "surrogateescape").splitlines(True)}
+        self.assertEqual(sorted(lines), ["sess-a"] + sorted(f"sess-m-{field}" for field in EXPORTED_AS_IT_IS) + ["sess-z"])
+        # The others are written as they are without it, byte for byte
+        self.assertEqual(sorted(line.encode("ascii", "surrogateescape") for name, line in lines.items()
+                                if name in ("sess-a", "sess-z")), sorted(expected.splitlines(True)))
+        self.assertIn(ACCENT.encode("utf-8"), expected)
+        for field, exported in EXPORTED_AS_IT_IS.items():
+            with self.subTest(field):
+                line = lines[f"sess-m-{field}"]
+                conversation = json.loads(line)
+                # Nothing is dropped or changed: the value reads back as it was in the transcript
+                self.assertEqual(conversation["messages"][0][exported], LONE)
+                self.assertEqual(conversation["messages"][0]["content"], ACCENT)
+                # The whole line, and only this line, has everything outside ASCII as \u escapes
+                self.assertTrue(line.isascii())
+                self.assertEqual(line, json.dumps(conversation) + "\n")
+                self.assertIn(json.dumps(LONE), line)

@@ -107,7 +107,7 @@ def _name(text):
 
 
 def _say(text):
-    """Print a line that can hold a path; what the terminal cannot show is escaped, not raised"""
+    """Print a line; what the terminal cannot show (an emoji, a path that is not text) is escaped, not raised"""
     try:
         print(text)
     except UnicodeEncodeError:
@@ -756,18 +756,22 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
 def _output_line(conversation, encoding):
     """One conversation as a line of the output file, or None when it cannot be written
 
-    A session is written as it always was, and a failure there still stops the export. A
-    sub-agent conversation must never do that, because the sessions around it were exported
-    before sub-agents were: what the file's encoding (UTF-8) cannot hold is escaped, and what is
-    nested too deeply to serialise is left out. Names are not what fails here: _name has
-    already made every one of them text, in a session and in a sub-agent alike.
+    No conversation stops the export for what the file's encoding (UTF-8) cannot hold, half of
+    a surrogate pair in an entry id, a timestamp or text: its whole line is then written with
+    everything outside ASCII as \\u escapes, which reads back as the same values, and the lines
+    around it are written as they always were. Names are not what fails here: _name has already
+    made every one of them text, in a session and in a sub-agent alike.
+
+    What is nested too deeply to serialise is left out when it is a sub-agent conversation,
+    because the sessions around it were exported before sub-agents were. In a session it still
+    stops the export, as it always did.
     """
-    if not conversation.get('subagent'):
-        return json.dumps(conversation, ensure_ascii=False) + '\n'
     try:
         line = json.dumps(conversation, ensure_ascii=False) + '\n'
         line.encode(encoding)
     except RecursionError:
+        if not conversation.get('subagent'):
+            raise
         return None
     except UnicodeEncodeError:
         line = json.dumps(conversation) + '\n'
@@ -775,20 +779,20 @@ def _output_line(conversation, encoding):
 
 
 def main():
-    print("="*80)
-    print("CLAUDE CODE COMPLETE DATA EXTRACTION")
-    print("="*80)
+    _say("="*80)
+    _say("CLAUDE CODE COMPLETE DATA EXTRACTION")
+    _say("="*80)
     print()
 
     # Find all Claude installations
-    print("🔍 Searching for Claude Code installations...")
+    _say("🔍 Searching for Claude Code installations...")
     installations = find_claude_installations()
 
     if not installations:
-        print("❌ No Claude Code installations found!")
+        _say("❌ No Claude Code installations found!")
         return
 
-    print(f"✅ Found {len(installations)} installation(s):")
+    _say(f"✅ Found {len(installations)} installation(s):")
     for inst in installations:
         _say(f"   - {inst}")
     print()
@@ -805,18 +809,18 @@ def main():
         if conversations:
             all_conversations.extend(conversations)
             installation_stats[str(installation)] = len(conversations)
-            print(f"   ✅ {len(conversations)} conversations")
+            _say(f"   ✅ {len(conversations)} conversations")
         else:
-            print(f"   ⚠️  No conversations found")
+            _say(f"   ⚠️  No conversations found")
 
     print()
-    print("="*80)
-    print("EXTRACTION COMPLETE")
-    print("="*80)
-    print(f"Total conversations: {len(all_conversations):,}")
+    _say("="*80)
+    _say("EXTRACTION COMPLETE")
+    _say("="*80)
+    _say(f"Total conversations: {len(all_conversations):,}")
 
     if not all_conversations:
-        print("No conversations found!")
+        _say("No conversations found!")
         return
 
     # Statistics
@@ -828,13 +832,13 @@ def main():
     complete = sum(1 for c in all_conversations
                    if any(m['role'] == 'assistant' for m in c['messages']))
 
-    print(f"Complete conversations: {complete:,}")
-    print(f"Sub-agent sessions: {subagents:,}")
-    print(f"Total messages: {total_messages:,}")
-    print(f"With tool use/diffs: {with_tools:,}")
+    _say(f"Complete conversations: {complete:,}")
+    _say(f"Sub-agent sessions: {subagents:,}")
+    _say(f"Total messages: {total_messages:,}")
+    _say(f"With tool use/diffs: {with_tools:,}")
     print()
 
-    print("Breakdown by installation:")
+    _say("Breakdown by installation:")
     for inst, count in sorted(installation_stats.items(), key=lambda x: -x[1]):
         _say(f"  {Path(inst).name:20} {count:5,} conversations")
     print()
@@ -853,16 +857,16 @@ def main():
             if line is None:
                 not_written += 1
                 # source_file is text by now, whatever the file is called
-                print(f"⚠️  Not written, nested too deeply to serialise: {conv['source_file']}")
+                _say(f"⚠️  Not written, nested too deeply to serialise: {conv['source_file']}")
                 continue
             f.write(line)
 
     file_size = output_file.stat().st_size / 1024 / 1024
-    print(f"✅ Saved to: {output_file}")
+    _say(f"✅ Saved to: {output_file}")
     if not_written:
-        print(f"   Sub-agent sessions not written: {not_written:,}")
-    print(f"   Size: {file_size:.2f} MB")
-    print(f"   Format: JSONL (one conversation per line)")
+        _say(f"   Sub-agent sessions not written: {not_written:,}")
+    _say(f"   Size: {file_size:.2f} MB")
+    _say(f"   Format: JSONL (one conversation per line)")
 
 if __name__ == '__main__':
     main()
