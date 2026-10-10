@@ -3,6 +3,7 @@
 Extract ALL Claude Code chat data from all projects
 Includes: messages, code context, diffs, file references
 Sub-agent transcripts are exported as conversations of their own
+A tool's structured output is kept with its result in a bounded form: 'structured' on a tool message
 A file or directory name that is not valid text is written as bytes://<percent-encoded bytes>
 Auto-discovers Claude Code installations on the device
 """
@@ -14,6 +15,7 @@ from pathlib import Path
 from datetime import datetime
 import hashlib
 import platform
+import math
 import os
 import sys
 from urllib.parse import quote
@@ -143,6 +145,113 @@ def _omitted_blocks(content):
             blocks.append({'type': item.get('type'), 'media_type': source.get('media_type'),
                            'encoded_size': len(source.get('data') or '')})
     return blocks
+
+
+STRUCTURED_STRING_LIMIT = 2000   # characters
+STRUCTURED_LIST_LIMIT = 100      # items
+STRUCTURED_DEPTH_LIMIT = 32      # containers inside one another
+STRUCTURED_SIZE_LIMIT = 16000    # bytes of JSON, after the limits above
+
+
+def _canonical(value):
+    """One JSON form of a value as bytes: sorted keys, no spaces, ASCII"""
+    return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+
+def _left_out(value=None):
+    """What is written in place of a value that is not embedded: its kind, size and SHA-256
+
+    The hash is of a string's UTF-8 bytes, or of the canonical JSON of a list or object, so two
+    exports of one input give the same marker. A value that has no such bytes, and with no
+    argument anything JSON output cannot hold, gives {'omitted': True, 'kind': 'unserialisable'}.
+    """
+    try:
+        raw = value.encode('utf-8') if isinstance(value, str) else _canonical(value)
+        kind = {str: 'string', list: 'list', dict: 'object'}[type(value)]
+    except (KeyError, RecursionError, TypeError, ValueError):
+        return {'omitted': True, 'kind': 'unserialisable'}
+    return {'omitted': True, 'kind': kind, 'length': len(value), 'sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def _bounded(value, depth=0, image=False):
+    """A value from a transcript with every long string and long list replaced by _left_out"""
+    if isinstance(value, str):
+        if image or len(value) > STRUCTURED_STRING_LIMIT:
+            return _left_out(value)
+        try:
+            value.encode('utf-8')
+        except UnicodeEncodeError:
+            return _left_out()  # half of a surrogate pair cannot be written as UTF-8
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        return _left_out()  # NaN and Infinity are not JSON
+    if isinstance(value, (list, dict)):
+        if depth >= STRUCTURED_DEPTH_LIMIT:
+            raise ValueError('nested too deeply')
+        if isinstance(value, list):
+            if len(value) > STRUCTURED_LIST_LIMIT:
+                return _left_out(value)
+            return [_bounded(item, depth + 1) for item in value]
+        # Image data is never embedded, however short: the 'base64' of a file that was read,
+        # and the 'data' of a base64 source
+        return {key: _bounded(item, depth + 1,
+                              image=key == 'base64' or (key == 'data' and value.get('type') == 'base64'))
+                for key, item in value.items()}
+    return value
+
+
+def _structured(value):
+    """A tool's structured output (toolUseResult), or any value of an entry, in a bounded form
+
+    Scalars and small containers are kept as they are. A string over STRUCTURED_STRING_LIMIT
+    characters, a list over STRUCTURED_LIST_LIMIT items and image data of any length are
+    replaced where they stand by _left_out, as is a value JSON cannot hold (NaN, Infinity,
+    text that is not UTF-8). If what is left is still over STRUCTURED_SIZE_LIMIT bytes, the
+    whole value is replaced. A value nested over STRUCTURED_DEPTH_LIMIT containers deep, or
+    with a key that is not UTF-8, is replaced whole by {'omitted': True, 'kind': 'unserialisable'}.
+    """
+    try:
+        bounded = _bounded(value)
+        size = len(json.dumps(bounded, ensure_ascii=False).encode('utf-8'))
+        return bounded if size <= STRUCTURED_SIZE_LIMIT else _left_out(value)
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return _left_out()
+
+
+SUBAGENT_TOTALS = {'totalTokens': 'total_tokens', 'usage': 'usage'}
+
+
+def _subagent_ref(result):
+    """What a sub-agent launch result says the sub-agent used, or None when it names no agent or no total
+
+    'agent' is the id the sub-agent's conversation is exported under ('agent' there, and in the
+    session's 'subagent_sessions'), so the totals reported to the parent can be set against the
+    usage of the sub-agent's own messages. They are never added to the parent's usage.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get('agentId'), str) or not result['agentId']:
+        return None
+    totals = {name: _structured(result[key]) for key, name in SUBAGENT_TOTALS.items() if key in result}
+    return {'agent': _name(result['agentId']), **totals} if totals else None
+
+
+def _link_calling_entries(unlinked, messages):
+    """Give each tool message whose entry did not name its caller the one exported entry that made the call
+
+    Nothing is written when no exported assistant message has a tool_use with that id, when
+    more than one has, or when the one that has carries no entry id.
+    """
+    callers = {}
+    for message in messages:
+        for tool_use in message.get('tool_uses', ()):  # only an assistant message has them
+            if isinstance(tool_use.get('id'), str):
+                made_by = callers.setdefault(tool_use['id'], [])
+                if message['id'] not in made_by:
+                    made_by.append(message['id'])
+    for tool_msg in unlinked:
+        made_by = callers.get(tool_msg['tool_call_id'], ()) if isinstance(tool_msg['tool_call_id'], str) else ()
+        if len(made_by) == 1 and isinstance(made_by[0], str) and made_by[0]:
+            tool_msg['source_assistant_id'] = made_by[0]
+
 
 def _messages_digest(messages):
     """One value for everything a conversation's messages say, so two copies can be compared"""
@@ -306,6 +415,7 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
     omitted_attachments = {}
     omitted_entries = {}
     skipped_lines = 0
+    unlinked = []  # tool messages with a structured result whose entry does not name the calling entry
     session_id = _name(jsonl_file.stem)
     project_path = None
     entry_session_id = None
@@ -328,6 +438,9 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
 
                     # Tool output is stored as a user entry; it is not something the user said
                     if isinstance(content, list):
+                        # The entry's structured result is written once, with its first tool result
+                        result = obj.get('toolUseResult')
+                        caller = obj.get('sourceToolAssistantUUID')
                         for item in content:
                             if isinstance(item, dict) and item.get('type') == 'tool_result':
                                 tool_msg = {
@@ -341,6 +454,16 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
                                 omitted = _omitted_blocks(item.get('content'))
                                 if omitted:
                                     tool_msg['omitted_content'] = omitted
+                                if isinstance(caller, str) and caller:
+                                    tool_msg['source_assistant_id'] = caller
+                                elif obj.get('toolUseResult') is not None:
+                                    unlinked.append(tool_msg)
+                                if result is not None:
+                                    tool_msg['structured'] = _structured(result)
+                                    launched = _subagent_ref(result)
+                                    if launched:
+                                        tool_msg['subagent_ref'] = launched
+                                    result = None
                                 messages.append(tool_msg)
                         content = [item for item in content
                                    if not (isinstance(item, dict) and item.get('type') == 'tool_result')]
@@ -405,6 +528,8 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
                         usage = message.get('usage')
                         if isinstance(usage, dict):
                             msg['usage'] = dict(usage)
+                        if message.get('stop_reason') is not None:
+                            msg['stop_reason'] = _structured(message['stop_reason'])
 
                         if thinking:
                             msg['reasoning'] = '\n'.join(thinking)
@@ -457,6 +582,8 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
 
     if not messages:
         return None, entry_session_id
+
+    _link_calling_entries(unlinked, messages)
 
     return {
         'messages': messages,

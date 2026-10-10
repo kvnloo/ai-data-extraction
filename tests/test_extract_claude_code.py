@@ -817,6 +817,37 @@ class ExtractClaudeCodeWholeExportTests(unittest.TestCase):
         for agent_id in ("a-deep", "z-deep"):
             self.assertIn(f"agent-{agent_id}.jsonl", printed)
 
+    def test_a_structured_tool_result_that_cannot_be_written_does_not_stop_the_export(self):
+        hostile = {"nan": float("nan"), "inf": float("-inf"), "cut": "half \ud83d", "text": "t" * 10_000_000}
+        rows = [user("u1", None, "go", sessionId="sess-1"), call(), result(toolUseResult=hostile)]
+        write_rows(self.project / "sess-2.jsonl", rows)
+        self.sub("hostile", rows)
+        write_rows(self.project / "sess-4.jsonl", rows[:2] + [result(toolUseResult=json.loads(deep(40)))])
+        # 50,000 levels cannot be written by json.dumps here, so the line is put together as text
+        line = json.dumps(result(toolUseResult="@")).replace('"@"', deep(50000))
+        (self.project / "sess-3.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows[:2]) + line + "\n")
+
+        written, printed = self.run_main()
+
+        text = next((self.out / "extracted_data").glob("*.jsonl")).read_text()
+        self.assertTrue(text.endswith("\n"))
+        for line in text.splitlines():
+            json.loads(line, parse_constant=self.fail)  # no bare NaN or Infinity reached the file
+        by_id = {c["session_id"]: c for c in written}
+        self.assertLessEqual({"sess-1", "sess-2", "sess-4", "agent-hostile"}, set(by_id))
+        expected = {"nan": UNSERIALISABLE, "inf": UNSERIALISABLE, "cut": UNSERIALISABLE,
+                    "text": marker("t" * 10_000_000)}
+        for session_id in ("sess-2", "agent-hostile"):
+            self.assertEqual(by_id[session_id]["messages"][-1]["structured"], expected)
+        self.assertEqual(by_id["sess-4"]["messages"][-1]["structured"], UNSERIALISABLE)
+        self.assertLess(len(text), 20_000)
+        if "sess-3" in by_id:
+            # An interpreter that can read the line exports the session and says the result was left out
+            self.assertEqual(by_id["sess-3"]["messages"][-1]["structured"], UNSERIALISABLE)
+        else:
+            # One that cannot loses that session, as it did before, and nothing else
+            self.assertIn("sess-3.jsonl", printed)
+
 
 
 BAD = b"\xff"  # a byte that is not text in any UTF-8 name
@@ -2144,3 +2175,378 @@ class SubagentCopyGroupingTests(unittest.TestCase):
                            "also_in": [str(elsewhere)]}])
         self.assertNotIn("contained_source_files", by_file[str(elsewhere)])
         self.assertEqual(output_by_dedupe_key(subs), 7)
+
+
+ADDED_FIELDS = ("structured", "source_assistant_id", "subagent_ref", "stop_reason")
+UNSERIALISABLE = {"omitted": True, "kind": "unserialisable"}
+STRING_LIMIT = extract_claude_code.STRUCTURED_STRING_LIMIT
+LIST_LIMIT = extract_claude_code.STRUCTURED_LIST_LIMIT
+
+
+def call(uuid="s1", tool_id="toolu_1", parent="u1", name="Bash", **message):
+    """An assistant entry that calls one tool"""
+    row = assistant(uuid, parent, [{"type": "tool_use", "id": tool_id, "name": name, "input": {"command": "true"}}])
+    row["message"].update(message)
+    return row
+
+
+def result(uuid="u2", tool_id="toolu_1", parent="s1", content="done", **extra):
+    """The user-type entry that carries a tool's result; `extra` are top-level fields such as toolUseResult"""
+    block = {"type": "tool_result", "tool_use_id": tool_id, "content": content}
+    if "is_error" in extra:
+        block["is_error"] = extra.pop("is_error")
+    return user(uuid, parent, [block], **extra)
+
+
+def marker(value):
+    """What the export writes in place of a value it does not embed"""
+    kind = {str: "string", list: "list", dict: "object"}[type(value)]
+    raw = value.encode() if kind == "string" else json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return {"omitted": True, "kind": kind, "length": len(value), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def shell_result(rng):
+    return {"stdout": "built " * rng.choice([1, 3, 900]), "stderr": "", "interrupted": False,
+            "returnCode": rng.randint(0, 2)}
+
+
+def edit_result(rng):
+    return {"filePath": "/work/app.py", "oldString": "a = 1", "newString": "a = 2",
+            "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+                                 "lines": ["-a = 1", "+a = 2"] * rng.choice([1, 80])}]}
+
+
+def read_result(rng):
+    lines = rng.choice([2, 400])
+    return {"type": "text", "file": {"filePath": "/work/app.py", "content": "import os\n" * lines,
+                                     "numLines": lines, "startLine": 1, "totalLines": lines}}
+
+
+def search_result(rng):
+    count = rng.choice([0, 3, 250])
+    return {"filenames": [f"/work/src/module_{n}.py" for n in range(count)], "numFiles": count, "durationMs": 12}
+
+
+def launch_result(rng):
+    usage = {"input_tokens": rng.randint(1, 900), "output_tokens": rng.randint(1, 90)}
+    return {"status": "completed", "agentId": "g", "totalTokens": sum(usage.values()), "totalDurationMs": 4200,
+            "usage": usage, "content": [{"type": "text", "text": "report " * rng.choice([2, 700])}]}
+
+
+def error_result(rng):
+    return "Error: " + "command not found " * rng.choice([1, 300])
+
+
+RESULTS = (shell_result, edit_result, read_result, search_result, launch_result, error_result)
+CONTENTS = ("ok", [{"type": "text", "text": "ok"}],
+            [{"type": "text", "text": "shot"},
+             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}])
+
+
+def generated_session(seed, new_fields):
+    """A synthetic session of tool calls; with `new_fields`, some entries carry what the export used to drop"""
+    rng = random.Random(seed)
+    rows = [user("g-u0", None, f"task {seed}", sessionId="sess-1")]
+    for n in range(rng.randint(1, 6)):
+        tool_id = f"toolu_{seed}_{n}"
+        made = call(f"g-s{n}", tool_id, rows[-1]["uuid"], name=rng.choice(["Bash", "Edit", "Read", "Glob", "Task"]),
+                    id=f"msg_{seed}_{n}")
+        back = result(f"g-r{n}", tool_id, f"g-s{n}", content=rng.choice(CONTENTS))
+        if rng.random() < 0.5:
+            back["message"]["content"][0]["is_error"] = rng.random() < 0.5
+        # The same draws are made either way, so the two forms of one seed differ only in these fields
+        stop_reason = rng.choice(["tool_use", "end_turn", None]) if rng.random() < 0.8 else "absent"
+        tool_use_result = rng.choice(RESULTS)(rng) if rng.random() < 0.8 else None
+        named = rng.random() < 0.6
+        if new_fields:
+            if stop_reason != "absent":
+                made["message"]["stop_reason"] = stop_reason
+            if tool_use_result is not None:
+                back["toolUseResult"] = tool_use_result
+            if named:
+                back["sourceToolAssistantUUID"] = f"g-s{n}"
+        rows += [made, back]
+    return rows
+
+
+def without_added(conversations, also=()):
+    return [{**c, "messages": [{k: v for k, v in m.items() if k not in ADDED_FIELDS + tuple(also)}
+                               for m in c["messages"]]} for c in conversations]
+
+
+class ExtractClaudeCodeToolResultTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.project = self.root / "projects" / "-work"
+        self.project.mkdir(parents=True)
+
+    def export(self, rows, **agents):
+        """Export a session of `rows`, with sub-agent transcripts by agent id; returns all conversations"""
+        write_rows(self.project / "sess-1.jsonl", rows)
+        for agent_id, agent_rows in agents.items():
+            write_rows(self.project / "sess-1" / "subagents" / f"agent-{agent_id}.jsonl", agent_rows)
+        return extract_claude_project_conversations(self.root)
+
+    def tools(self, *rows):
+        """The tool messages of a session that starts with a prompt and goes on with `rows`"""
+        messages = self.export([user("u1", None, "go"), *rows])[0]["messages"]
+        return [m for m in messages if m["role"] == "tool"]
+
+    def structured(self, tool_use_result):
+        return self.tools(call(), result(toolUseResult=tool_use_result))[0]["structured"]
+
+    def test_a_tool_message_carries_the_structured_result_and_the_entry_that_made_the_call(self):
+        shell = {"stdout": "", "stderr": "make: *** [build] Error 2", "interrupted": False, "returnCode": 2,
+                 "timing": {"wallMs": 1250.5, "killed": None}, "signals": ["SIGPIPE", 13]}
+
+        tool, = self.tools(call(), result(is_error=True, toolUseResult=shell, sourceToolAssistantUUID="elsewhere"))
+
+        self.assertEqual(tool["tool_call_id"], "toolu_1")
+        self.assertIs(tool["is_error"], True)
+        self.assertEqual(tool["structured"], shell)
+        # What the entry says is used as it is, not replaced by a search
+        self.assertEqual(tool["source_assistant_id"], "elsewhere")
+
+    def test_without_the_new_fields_a_tool_message_is_what_it_was(self):
+        tool, = self.tools(call(), result())
+
+        self.assertEqual(list(tool), ["role", "tool_call_id", "content", "is_error", "timestamp", "id", "parent_id"])
+        self.assertIs(tool["is_error"], False)
+
+    def test_the_calling_entry_is_found_by_its_tool_use_when_the_result_does_not_name_it(self):
+        tool, = self.tools(call(), result(toolUseResult={"stdout": "ok"}))
+        self.assertEqual(tool["source_assistant_id"], "s1")
+
+        tool, = self.tools(call(), result(toolUseResult=0))
+        self.assertEqual((tool["structured"], tool["source_assistant_id"]), (0, "s1"))
+
+        # The call can be written after its result
+        tool, = self.tools(result(toolUseResult={"stdout": "ok"}), call())
+        self.assertEqual(tool["source_assistant_id"], "s1")
+
+    def test_the_calling_entry_is_never_guessed(self):
+        found = {"stdout": "ok"}
+        cases = {
+            "no entry made this call": [call(tool_id="toolu_other"), result(toolUseResult=found)],
+            "two entries made it": [call(), call(uuid="s9"), result(toolUseResult=found)],
+            "the entry has no id": [call(uuid=None), result(toolUseResult=found)],
+            "the name is not an id": [call(), result(sourceToolAssistantUUID=["s1"])],
+            "the name is empty": [call(), result(sourceToolAssistantUUID="")],
+            "the call id is not an id": [call(tool_id=["toolu_1"]), result(tool_id=["toolu_1"], toolUseResult=found)],
+            "the entry id is empty": [call(uuid=""), result(toolUseResult=found)],
+            "the entry id is not an id": [call(uuid=7), result(toolUseResult=found)],
+        }
+        for case, rows in cases.items():
+            with self.subTest(case):
+                tool, = self.tools(*rows)
+                self.assertNotIn("source_assistant_id", tool)
+
+    def test_one_entry_written_twice_is_still_one_calling_entry(self):
+        tool, = self.tools(call(), call(), result(toolUseResult={"stdout": "ok"}))
+        self.assertEqual(tool["source_assistant_id"], "s1")
+
+    def test_an_entry_with_several_results_gives_its_structured_result_once(self):
+        both = user("u2", "s1", [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "one"},
+                                 {"type": "tool_result", "tool_use_id": "toolu_2", "content": "two"}],
+                    toolUseResult={"agentId": "g", "totalTokens": 7}, sourceToolAssistantUUID="s1")
+
+        first, second = self.tools(call(), both)
+
+        self.assertEqual(first["structured"], {"agentId": "g", "totalTokens": 7})
+        self.assertIn("subagent_ref", first)
+        self.assertNotIn("structured", second)
+        self.assertNotIn("subagent_ref", second)
+        self.assertEqual([first["source_assistant_id"], second["source_assistant_id"]], ["s1", "s1"])
+
+        del both["sourceToolAssistantUUID"]
+        both["message"]["content"][1]["tool_use_id"] = "toolu_1"
+        first, second = self.tools(call(), both)
+        self.assertEqual([first["source_assistant_id"], second["source_assistant_id"]], ["s1", "s1"])
+
+    def test_a_null_result_or_one_on_an_entry_without_a_tool_result_adds_nothing(self):
+        tool, = self.tools(call(), result(toolUseResult=None))
+        self.assertEqual(without_added([{"messages": [tool]}])[0]["messages"], [tool])
+
+        prompt = self.export([user("u1", None, "go", toolUseResult={"stdout": "ok"}, sourceToolAssistantUUID="s1")])
+        self.assertEqual(list(prompt[0]["messages"][0]), ["role", "content", "timestamp", "id", "parent_id"])
+
+    def test_a_long_string_is_described_not_embedded(self):
+        kept, long = "k" * STRING_LIMIT, "é" * (STRING_LIMIT + 1)
+
+        structured = self.structured({"stdout": kept, "stderr": long, "nested": {"deeper": [long]}})
+
+        self.assertEqual(structured, {"stdout": kept, "stderr": marker(long), "nested": {"deeper": [marker(long)]}})
+        self.assertEqual(structured["stderr"]["length"], STRING_LIMIT + 1)
+        self.assertEqual(structured["stderr"]["sha256"], hashlib.sha256(long.encode("utf-8")).hexdigest())
+
+    def test_a_long_list_is_described_not_embedded(self):
+        kept, long = list(range(LIST_LIMIT)), [{"b": 1, "a": [n]} for n in range(LIST_LIMIT + 1)]
+
+        structured = self.structured({"filenames": kept, "matches": long})
+
+        self.assertEqual(structured, {"filenames": kept, "matches": marker(long)})
+        canonical = "[" + ",".join('{"a":[%d],"b":1}' % n for n in range(LIST_LIMIT + 1)) + "]"
+        self.assertEqual(structured["matches"]["sha256"], hashlib.sha256(canonical.encode()).hexdigest())
+
+    def test_a_result_that_is_a_string_follows_the_same_limit(self):
+        self.assertEqual(self.structured("Error: no such file"), "Error: no such file")
+        self.assertEqual(self.structured("E" * (STRING_LIMIT + 1)), marker("E" * (STRING_LIMIT + 1)))
+        self.assertEqual(self.structured(["a", "b"]), ["a", "b"])
+        self.assertEqual(self.structured(0), 0)
+        self.assertIs(self.structured(False), False)
+        # The limit is in characters, and the size is that of the text as it is written
+        self.assertEqual(self.structured("\U0001f600" * STRING_LIMIT), "\U0001f600" * STRING_LIMIT)
+
+    def test_two_exports_of_one_input_agree(self):
+        rows = [user("u1", None, "go"), call(), result(toolUseResult=read_result(random.Random(1)) | {"n": [1] * 500})]
+        self.assertEqual(json.dumps(self.export(rows)), json.dumps(self.export(rows)))
+
+    def test_an_image_and_a_whole_file_add_less_than_1_kb_each(self):
+        def size(*extra, **fields):
+            conversation, = self.export([user("u1", None, "go"), call(), result(content="x", **fields)])
+            text = json.dumps(conversation, ensure_ascii=False)
+            for payload in extra:
+                self.assertNotIn(payload, text)
+            return len(text.encode("utf-8"))
+
+        plain = size()
+        picture = "iVBORw0KGgo" + "QUJD" * 100_000
+        source_code = "def handler(event):\n    return event\n" * 140_000
+        self.assertGreater(len(source_code), 5_000_000)
+        cases = {
+            "image": ({"type": "image", "file": {"base64": picture, "type": "image/png", "originalSize": 300_000,
+                                                "dimensions": {"originalWidth": 800, "originalHeight": 600}}},
+                      "QUJDQUJD"),
+            # An image small enough to pass as a short string is still an image
+            "small image": ({"type": "image", "file": {"base64": "iVBORw0KGgoQUJD", "type": "image/png"}}, "iVBOR"),
+            "image block": ({"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                                      "data": "iVBORw0KGgoQUJD"}}]}, "iVBOR"),
+            "file read": ({"type": "text", "file": {"filePath": "/work/handler.py", "content": source_code,
+                                                    "numLines": 280_000, "startLine": 1, "totalLines": 280_000}},
+                          "def handler"),
+        }
+        for case, (tool_use_result, payload) in cases.items():
+            with self.subTest(case):
+                added = size(payload, toolUseResult=tool_use_result) - plain
+                self.assertGreater(added, 0)
+                self.assertLess(added, 1024)
+
+        image = self.structured(cases["small image"][0])
+        self.assertEqual(image, {"type": "image", "file": {"base64": marker("iVBORw0KGgoQUJD"), "type": "image/png"}})
+        # 'data' is only image data beside a base64 type
+        self.assertEqual(self.structured({"data": "rows: 3", "type": "table"}), {"data": "rows: 3", "type": "table"})
+
+    def test_many_small_values_cannot_add_up_to_a_large_field(self):
+        wide = {f"field_{n}": "v" * STRING_LIMIT for n in range(200)}
+        grid = [["cell " * 300] * LIST_LIMIT] * LIST_LIMIT
+
+        self.assertEqual(self.structured(wide), marker(wide))
+        self.assertEqual(self.structured(grid), marker(grid))
+        small = {f"field_{n}": "v" * 100 for n in range(50)}
+        self.assertEqual(self.structured(small), small)
+
+    def test_what_json_cannot_hold_is_said_to_be_left_out(self):
+        self.assertEqual(self.structured({"rate": float("nan"), "limit": float("inf"), "low": float("-inf"),
+                                          "cut": "half a pair \ud83d", "fine": 1.5}),
+                         {"rate": UNSERIALISABLE, "limit": UNSERIALISABLE, "low": UNSERIALISABLE,
+                          "cut": UNSERIALISABLE, "fine": 1.5})
+        self.assertEqual(self.structured("x" * STRING_LIMIT + "\udc80"), UNSERIALISABLE)
+        self.assertEqual(self.structured(float("nan")), UNSERIALISABLE)
+        self.assertEqual(self.structured({"bad key \ud800": 1, "fine": 2}), UNSERIALISABLE)
+        self.assertEqual(self.structured([float("nan")] * (LIST_LIMIT + 1))["kind"], "list")
+
+    def test_a_result_nested_too_deeply_is_said_to_be_left_out(self):
+        limit = extract_claude_code.STRUCTURED_DEPTH_LIMIT
+        self.assertEqual(self.structured(json.loads(deep(limit))), json.loads(deep(limit)))
+        self.assertEqual(self.structured(json.loads(deep(limit + 1))), UNSERIALISABLE)
+        self.assertEqual(self.structured({"a": json.loads(deep(900))}), UNSERIALISABLE)
+
+    def test_the_stop_reason_of_a_response_is_kept(self):
+        messages = self.export([user("u1", None, "go"), call(stop_reason="tool_use"), result(),
+                                call(uuid="s2", stop_reason=None), call(uuid="s3"),
+                                call(uuid="s4", stop_reason=float("inf"))])[0]["messages"]
+
+        replies = [m for m in messages if m["role"] == "assistant"]
+        self.assertEqual(replies[0]["stop_reason"], "tool_use")
+        self.assertNotIn("stop_reason", replies[1])
+        self.assertNotIn("stop_reason", replies[2])
+        self.assertEqual(replies[3]["stop_reason"], UNSERIALISABLE)
+
+    def test_a_sub_agent_launch_can_be_reconciled_with_the_sub_agent_conversation(self):
+        sub_usage = {"input_tokens": 100, "output_tokens": 40, "cache_creation_input_tokens": 0,
+                     "cache_read_input_tokens": 9}
+        reported = {"input_tokens": 300, "output_tokens": 120, "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 27}
+        launch = {"status": "completed", "agentId": "helper", "totalTokens": 447, "totalDurationMs": 5100,
+                  "totalToolUseCount": 0, "usage": reported, "content": [{"type": "text", "text": "All three pass."}]}
+        parent_rows = transcript("main", PARENT_USAGE) + [
+            call(parent="main-s0", name="Task", id="msg-launch", usage=PARENT_USAGE),
+            result(toolUseResult=launch, sourceToolAssistantUUID="s1")]
+
+        conversations = self.export(parent_rows, helper=transcript("helper", sub_usage, "sess-1", "helper", replies=3))
+
+        parent, sub = conversations
+        tool = parent["messages"][-1]
+        self.assertEqual({key: tool["structured"][key] for key in ("agentId", "totalTokens", "usage")},
+                         {"agentId": "helper", "totalTokens": 447, "usage": reported})
+        self.assertEqual(tool["subagent_ref"], {"agent": "helper", "total_tokens": 447, "usage": reported})
+        # The same id names the launch, the session's list of sub-agents and the sub-agent conversation
+        self.assertEqual(parent["subagent_sessions"], [tool["subagent_ref"]["agent"]])
+        self.assertEqual(sub["agent"], tool["subagent_ref"]["agent"])
+        # What the parent was told the sub-agent used against what the sub-agent's own responses add up to
+        self.assertEqual(total_usage([sub]), tool["subagent_ref"]["usage"])
+        self.assertEqual(sum(total_usage([sub]).values()), tool["subagent_ref"]["total_tokens"])
+        # The parent's own usage is its two responses and nothing of the sub-agent's
+        self.assertEqual(total_usage([parent]), {key: 2 * value for key, value in PARENT_USAGE.items()})
+        self.assertNotIn("usage", tool)
+
+    def test_a_launch_reference_holds_only_what_the_result_states(self):
+        ref = lambda tool_use_result: self.tools(call(), result(toolUseResult=tool_use_result))[0].get("subagent_ref", "absent")
+
+        self.assertEqual(ref({"agentId": "g", "totalTokens": 5}), {"agent": "g", "total_tokens": 5})
+        self.assertEqual(ref({"agentId": "g", "usage": {"output_tokens": 5}}),
+                         {"agent": "g", "usage": {"output_tokens": 5}})
+        self.assertEqual(ref({"agentId": "g", "totalTokens": float("nan")}),
+                         {"agent": "g", "total_tokens": UNSERIALISABLE})
+        # A launch still running reports no totals; a result with totals and no agent names no one
+        self.assertEqual("absent", ref({"agentId": "g", "status": "async_launched"}))
+        self.assertEqual("absent", ref({"totalTokens": 5, "usage": {}}))
+        self.assertEqual("absent", ref({"agentId": 7, "totalTokens": 5}))
+        self.assertEqual("absent", ref({"agentId": "", "totalTokens": 5}))
+        self.assertEqual("absent", ref("agentId totalTokens"))
+        # An id that is not text is written the way the sub-agent's file name is
+        self.assertEqual(ref({"agentId": "\udcff", "totalTokens": 5})["agent"], "bytes://%FF")
+
+    def test_the_added_fields_are_the_only_difference_they_make(self):
+        for seed in range(200):
+            with self.subTest(seed=seed):
+                rich, bare = generated_session(seed, True), generated_session(seed, False)
+                before = self.export(bare, g=bare)
+                after = self.export(rich, g=rich)
+
+                self.assertEqual(without_added(before), before)
+                self.assertEqual(without_added(after, also=["dedupe_key"]),
+                                 without_added(before, also=["dedupe_key"]))
+                self.assertLess(len(json.dumps(after)) - len(json.dumps(before)), 12 * 3000)
+
+    def test_a_dedupe_key_covers_the_added_fields_and_copies_still_get_equal_keys(self):
+        rich = [user("u1", None, "go", sessionId="sess-1"), call(stop_reason="tool_use"),
+                result(toolUseResult={"stdout": "ok"}, sourceToolAssistantUUID="s1")]
+        bare = [user("u1", None, "go", sessionId="sess-1"), call(), result()]
+
+        def keys(rows):
+            write_rows(self.project / "agent-g.jsonl", rows)  # a second copy, beside the session
+            session, sub = self.export(rows, g=rows)
+            self.assertEqual(len(sub["duplicate_source_files"]), 1)
+            for message in sub["messages"]:
+                rest = {k: v for k, v in message.items() if k != "dedupe_key"}
+                self.assertEqual(message["dedupe_key"],
+                                 hashlib.sha256(json.dumps([rest], sort_keys=True).encode()).hexdigest())
+            return [message["dedupe_key"] for message in sub["messages"]]
+
+        with_fields, without_fields = keys(rich), keys(bare)
+        self.assertEqual(with_fields[0], without_fields[0])  # the prompt has none of the new fields
+        self.assertNotEqual(with_fields[1], without_fields[1])
+        self.assertNotEqual(with_fields[2], without_fields[2])
