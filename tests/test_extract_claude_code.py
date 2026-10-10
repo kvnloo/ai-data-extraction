@@ -1,5 +1,9 @@
+import hashlib
+import itertools
 import json
 import os
+import random
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -1125,30 +1129,67 @@ def reply(uuid, parent, usage=None, session_id="sess-1", agent_id="x"):
                         "content": [{"type": "text", "text": f"{uuid} says"}]}}
 
 
+def output_of(messages):
+    return sum(m["usage"]["output_tokens"] for m in messages if m.get("usage"))
+
+
 def output_per_conversation(conversations):
     """Output tokens summed the plain way: every conversation, every message"""
-    return sum(m["usage"]["output_tokens"] for c in conversations for m in c["messages"] if m.get("usage"))
+    return sum(output_of(c["messages"]) for c in conversations)
 
 
-def output_after_dedupe(conversations):
-    """Output tokens summed by the rule extract_claude_project_conversations documents for its copy fields"""
-    total = 0
+def output_by_dedupe_key(conversations):
+    """Output tokens summed the way extract_claude_project_conversations documents: once for each 'dedupe_key'"""
+    first = {}
     for conversation in conversations:
-        own = conversation["source_file"]
-        if any(other["source_file"] < own for other in conversation.get("same_transcript_in", [])):
-            continue
-        skip = max([other["shared_leading_messages"] for other in conversation.get("shared_prefix_with", [])
-                    if other["source_file"] < own], default=0)
-        total += sum(m["usage"]["output_tokens"] for m in conversation["messages"][skip:] if m.get("usage"))
-    return total
+        for message in conversation["messages"]:
+            first.setdefault(message["dedupe_key"], message)
+    return output_of(first.values())
 
 
-COPY_FIELDS = ("duplicate_source_files", "prefix_source_files", "reordered_source_files", "shared_prefix_with",
-               "same_transcript_in")
+def message_identities(conversation):
+    """What tells each message of an exported conversation apart, worked out here and not read from 'dedupe_key'"""
+    messages = [{k: v for k, v in m.items() if k != "dedupe_key"} for m in conversation["messages"]]
+    if all(isinstance(m.get("id"), str) and m["id"] for m in messages):
+        return [json.dumps(m, sort_keys=True) for m in messages]
+    # without entry ids no message can be said to be another
+    return [(conversation["source_file"], index) for index in range(len(messages))]
+
+
+def output_by_message(conversations):
+    """Output tokens summed once for each different message, without trusting 'dedupe_key'"""
+    first = {}
+    for conversation in conversations:
+        for identity, message in zip(message_identities(conversation), conversation["messages"]):
+            first.setdefault(identity, message)
+    return output_of(first.values())
+
+
+def output_written(*files):
+    """Output tokens of every different response in the rows that were written: the true total"""
+    usage = {}
+    for rows in files:
+        for row in rows:
+            if row.get("type") == "assistant":
+                usage[json.dumps(row, sort_keys=True)] = row["message"]["usage"]["output_tokens"]
+    return sum(usage.values())
+
+
+COPY_FIELDS = ("duplicate_source_files", "contained_source_files", "overlapping_source_files")
+# What the copy fields were called before one grouping replaced the comparison of two files at a time
+FORMER_COPY_FIELDS = ("prefix_source_files", "reordered_source_files", "shared_prefix_with", "same_transcript_in")
+
+
+def copy_fields(conversation):
+    return [name for name in COPY_FIELDS + FORMER_COPY_FIELDS if name in conversation]
+
+
+def overlaps(conversation):
+    return {r["source_file"]: r["shared_messages"] for r in conversation.get("overlapping_source_files", [])}
 
 
 class SubagentCopyTests(unittest.TestCase):
-    """Two files that hold one sub-agent transcript, when they are not the same byte for byte"""
+    """Files that hold one sub-agent transcript, when they are not the same byte for byte"""
 
     setUp = ExtractClaudeCodeSubagentTests.setUp
     parent = ExtractClaudeCodeSubagentTests.parent
@@ -1157,8 +1198,8 @@ class SubagentCopyTests(unittest.TestCase):
     def rows(self, replies=3, session_id="sess-1"):
         return transcript("x", dict(COPY_USAGE), session_id, "x", replies=replies)
 
-    def nested(self, rows, session_id="sess-1", under=""):
-        return write_rows(self.project / session_id / "subagents" / under / "agent-x.jsonl", rows)
+    def nested(self, rows, session_id="sess-1", under="", agent="x"):
+        return write_rows(self.project / session_id / "subagents" / under / f"agent-{agent}.jsonl", rows)
 
     def beside(self, rows):
         return write_rows(self.project / "agent-x.jsonl", rows)
@@ -1166,7 +1207,8 @@ class SubagentCopyTests(unittest.TestCase):
     def reconciles(self, subs, conversations, per_conversation, true_total):
         self.assertEqual(len(subs), conversations)
         self.assertEqual(output_per_conversation(subs), per_conversation)
-        self.assertEqual(output_after_dedupe(subs), true_total)
+        self.assertEqual(output_by_dedupe_key(subs), true_total)
+        self.assertEqual(output_by_message(subs), true_total)
 
     def test_a_copy_that_stops_early_is_left_out_and_the_complete_one_says_so(self):
         self.parent()
@@ -1180,8 +1222,8 @@ class SubagentCopyTests(unittest.TestCase):
         self.assertEqual(subs[0]["source_file"], str(full))
         self.assertEqual([m["id"] for m in subs[0]["messages"]], ["x-u", "x-s0", "x-s1", "x-s2"])
         self.assertEqual(subs[0]["duplicate_source_files"], [str(short)])
-        self.assertEqual(subs[0]["prefix_source_files"],
-                         [{"source_file": str(short), "compared_with": str(full), "shared_leading_messages": 2}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 2, "order_matched": True}])
         self.assertEqual(mains[0]["subagent_sessions"], ["x"])
 
     def test_the_complete_copy_is_kept_whichever_file_is_read_first(self):
@@ -1195,8 +1237,8 @@ class SubagentCopyTests(unittest.TestCase):
         self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
         self.assertEqual(subs[0]["source_file"], str(full))
         self.assertEqual(subs[0]["duplicate_source_files"], [str(short)])
-        self.assertEqual(subs[0]["prefix_source_files"],
-                         [{"source_file": str(short), "compared_with": str(full), "shared_leading_messages": 3}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 3, "order_matched": True}])
 
     def test_a_copy_cut_in_the_middle_of_a_line_is_a_shorter_copy(self):
         self.parent()
@@ -1210,8 +1252,8 @@ class SubagentCopyTests(unittest.TestCase):
         self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
         self.assertEqual(subs[0]["source_file"], str(full))
         self.assertEqual(subs[0]["skipped_lines"], 0)
-        self.assertEqual(subs[0]["prefix_source_files"],
-                         [{"source_file": str(cut), "compared_with": str(full), "shared_leading_messages": 3}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(cut), "shared_messages": 3, "order_matched": True}])
 
     def test_three_copies_of_growing_length_leave_the_longest(self):
         self.parent()
@@ -1224,10 +1266,11 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
         self.assertEqual(subs[0]["source_file"], str(third))
-        self.assertEqual(sorted(subs[0]["duplicate_source_files"]), sorted([str(first), str(second)]))
-        self.assertEqual(sorted(subs[0]["prefix_source_files"], key=lambda r: r["shared_leading_messages"]),
-                         [{"source_file": str(first), "compared_with": str(second), "shared_leading_messages": 2},
-                          {"source_file": str(second), "compared_with": str(third), "shared_leading_messages": 3}])
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(first), str(second)])
+        # each is described against the file that is exported, not against one that is itself left out
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(first), "shared_messages": 2, "order_matched": True},
+                          {"source_file": str(second), "shared_messages": 3, "order_matched": True}])
 
     def test_the_shorter_copy_still_gives_its_meta_file(self):
         self.parent()
@@ -1252,21 +1295,20 @@ class SubagentCopyTests(unittest.TestCase):
         # Five responses were made: two shared, one on one side, two on the other
         self.reconciles(subs, conversations=2, per_conversation=280, true_total=200)
         by_file = {c["source_file"]: c for c in subs}
-        self.assertEqual(by_file[str(left)]["shared_prefix_with"],
-                         [{"source_file": str(right), "shared_leading_messages": 3}])
-        self.assertEqual(by_file[str(right)]["shared_prefix_with"],
-                         [{"source_file": str(left), "shared_leading_messages": 3}])
+        self.assertEqual(by_file[str(left)]["overlapping_source_files"],
+                         [{"source_file": str(right), "shared_messages": 3}])
+        self.assertEqual(by_file[str(right)]["overlapping_source_files"],
+                         [{"source_file": str(left), "shared_messages": 3}])
         self.assertEqual([m["id"] for m in by_file[str(left)]["messages"]], ["x-u", "x-s0", "x-s1", "left"])
         self.assertEqual([m["id"] for m in by_file[str(right)]["messages"]],
                          ["x-u", "x-s0", "x-s1", "right", "right-2"])
         for conversation in subs:
-            self.assertNotIn("duplicate_source_files", conversation)
-            self.assertNotIn("prefix_source_files", conversation)
+            self.assertEqual(copy_fields(conversation), ["overlapping_source_files"])
 
-    def test_a_copy_that_parts_ways_names_the_file_that_is_exported(self):
+    def test_a_copy_two_others_carry_on_from_is_recorded_once_and_names_the_other(self):
         self.parent()
         rows = self.rows(replies=2)
-        short = self.beside(rows[:3])  # left out: the next file continues it
+        short = self.beside(rows[:3])  # left out: both other files have all of it
         left = self.nested(rows + [reply("left", "x-s1")])
         right = self.nested(rows + [reply("right", "x-s1")], under="later")
 
@@ -1275,24 +1317,68 @@ class SubagentCopyTests(unittest.TestCase):
         self.reconciles(subs, conversations=2, per_conversation=240, true_total=160)
         by_file = {c["source_file"]: c for c in subs}
         self.assertEqual(sorted(by_file), sorted([str(left), str(right)]))
-        self.assertEqual(by_file[str(right)]["shared_prefix_with"],
-                         [{"source_file": str(left), "shared_leading_messages": 3}])
-        self.assertEqual(by_file[str(left)]["shared_prefix_with"],
-                         [{"source_file": str(right), "shared_leading_messages": 3}])
-        recorded = [r for c in subs for r in c.get("prefix_source_files", [])]
-        self.assertEqual(recorded, [{"source_file": str(short), "compared_with": str(left), "shared_leading_messages": 2}])
+        self.assertEqual(overlaps(by_file[str(right)]), {str(left): 3})
+        self.assertEqual(overlaps(by_file[str(left)]), {str(right): 3})
+        # both have as many messages, so the first read records it
+        self.assertEqual(by_file[str(left)]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 2, "order_matched": True,
+                           "also_in": [str(right)]}])
+        self.assertEqual(by_file[str(left)]["duplicate_source_files"], [str(short)])
+        self.assertEqual(copy_fields(by_file[str(right)]), ["overlapping_source_files"])
 
-    def test_transcripts_that_share_no_leading_message_carry_no_copy_fields(self):
-        self.parent()
+    def test_a_copy_three_others_carry_on_from_names_the_others_in_the_order_they_are_read(self):
         rows = self.rows(replies=2)
-        self.beside(rows)
-        self.nested([reply("other", None)] + rows[2:])
+        short = self.beside(rows[:3])
+        first, second, third = (self.nested(rows + [reply(name, "x-s1")], under=name) for name in ("a", "b", "c"))
 
         _, subs = self.export()
 
-        self.reconciles(subs, conversations=2, per_conversation=200, true_total=200)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(by_file[str(first)]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 2, "order_matched": True,
+                           "also_in": [str(second), str(third)]}])
+        self.assertEqual(by_file[str(third)]["overlapping_source_files"],
+                         [{"source_file": str(first), "shared_messages": 3}, {"source_file": str(second), "shared_messages": 3}])
+
+    def test_a_copy_two_others_have_is_recorded_on_the_one_with_more_messages(self):
+        rows = self.rows(replies=2)
+        short = self.beside(rows[:3])
+        left = self.nested(rows + [reply("left", "x-s1")])
+        right = self.nested(rows + [reply("right", "x-s1"), reply("right-2", "right")], under="later")
+
+        _, subs = self.export()
+
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(by_file[str(right)]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 2, "order_matched": True,
+                           "also_in": [str(left)]}])
+        self.assertEqual(copy_fields(by_file[str(left)]), ["overlapping_source_files"])
+
+    def test_transcripts_that_share_only_later_messages_name_each_other(self):
+        self.parent()
+        rows = self.rows(replies=2)
+        one = self.beside(rows)
+        two = self.nested([reply("other", None)] + rows[2:])
+
+        _, subs = self.export()
+
+        # x-s0 and x-s1 are in both; nothing is shared from the start
+        self.reconciles(subs, conversations=2, per_conversation=200, true_total=120)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(overlaps(by_file[str(one)]), {str(two): 2})
+        self.assertEqual(overlaps(by_file[str(two)]), {str(one): 2})
+
+    def test_transcripts_that_share_no_message_carry_no_copy_fields(self):
+        self.parent()
+        rows = self.rows(replies=2)
+        self.beside(rows)
+        self.nested([reply("other", None), reply("other-2", "other")])
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=160, true_total=160)
         for conversation in subs:
-            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+            self.assertEqual(copy_fields(conversation), [])
 
     def test_the_same_entries_in_another_order_are_exported_once_in_the_order_of_their_parent_ids(self):
         rows = self.rows(replies=3)
@@ -1308,9 +1394,8 @@ class SubagentCopyTests(unittest.TestCase):
                 self.assertEqual(subs[0]["source_file"], str(kept))
                 self.assertEqual([m["id"] for m in subs[0]["messages"]], ["x-u", "x-s0", "x-s1", "x-s2"])
                 self.assertEqual(subs[0]["duplicate_source_files"], [str(other)])
-                self.assertEqual(subs[0]["reordered_source_files"],
-                                 [{"source_file": str(other), "compared_with": str(kept), "kept_by": "parent_id_chain"}])
-                self.assertNotIn("prefix_source_files", subs[0])
+                self.assertEqual(subs[0]["contained_source_files"],
+                                 [{"source_file": str(other), "shared_messages": 4, "order_matched": False}])
 
     def test_parent_ids_are_followed_through_entries_that_are_not_exported(self):
         # x-s0 answers a note that is not exported; the note answers the prompt
@@ -1322,8 +1407,8 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.assertEqual(len(subs), 1)
         self.assertEqual(subs[0]["source_file"], str(beside))
-        self.assertEqual(subs[0]["reordered_source_files"],
-                         [{"source_file": str(nested), "compared_with": str(beside), "kept_by": "parent_id_chain"}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(nested), "shared_messages": 2, "order_matched": False}])
 
     def test_without_an_order_to_follow_the_copy_under_the_session_is_kept(self):
         def unlinked(rows):
@@ -1340,8 +1425,8 @@ class SubagentCopyTests(unittest.TestCase):
                 self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
                 self.assertEqual(subs[0]["source_file"], str(nested))
                 self.assertEqual(subs[0]["duplicate_source_files"], [str(beside)])
-                self.assertEqual(subs[0]["reordered_source_files"],
-                                 [{"source_file": str(beside), "compared_with": str(nested), "kept_by": "nested_layout"}])
+                self.assertEqual(subs[0]["contained_source_files"],
+                                 [{"source_file": str(beside), "shared_messages": 4, "order_matched": False}])
 
     def test_neither_order_following_the_parent_ids_falls_back_to_the_copy_under_the_session(self):
         rows = self.rows(replies=3)
@@ -1352,10 +1437,9 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.assertEqual(len(subs), 1)
         self.assertEqual(subs[0]["source_file"], str(nested))
-        self.assertEqual(subs[0]["reordered_source_files"],
-                         [{"source_file": str(beside), "compared_with": str(nested), "kept_by": "nested_layout"}])
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(beside)])
 
-    def test_two_copies_under_the_session_with_no_order_to_follow_keep_the_first_found(self):
+    def test_two_copies_under_the_session_with_no_order_to_follow_keep_the_first_read(self):
         rows = [dict(row, parentUuid=None) for row in self.rows(replies=3)]
         first = self.nested(rows)
         second = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]], under="later")
@@ -1364,8 +1448,31 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
         self.assertEqual(subs[0]["source_file"], str(first))
-        self.assertEqual(subs[0]["reordered_source_files"],
-                         [{"source_file": str(second), "compared_with": str(first), "kept_by": "first_found"}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(second), "shared_messages": 4, "order_matched": False}])
+
+    def test_an_order_found_under_the_session_is_kept_from_the_first_file_that_has_it(self):
+        rows = [dict(row, parentUuid=None) for row in self.rows(replies=3)]
+        mixed = [rows[0], rows[1], rows[4], rows[2], rows[3]]
+        beside = self.beside(rows)  # the same order is under the session too, and this file is read first
+        nested = self.nested(rows)
+        other_order = self.nested(mixed, under="aaa")  # read before the other file under the session
+
+        _, subs = self.export()
+
+        self.assertEqual([c["source_file"] for c in subs], [str(beside)])
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(other_order), str(nested)])
+        self.assertEqual([r["order_matched"] for r in subs[0]["contained_source_files"]], [False, True])
+
+    def test_an_order_found_only_under_another_session_does_not_decide_which_file_is_kept(self):
+        rows = [dict(row, parentUuid=None) for row in self.rows(replies=3)]
+        self.beside(rows)
+        nested = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]])
+        elsewhere = self.nested(rows, "sess-2")  # the order of the file beside the sessions, for another session
+
+        _, subs = self.export()
+
+        self.assertEqual(sorted(c["source_file"] for c in subs), sorted([str(nested), str(elsewhere)]))
 
     def test_a_parent_id_that_is_not_text_does_not_stop_the_comparison(self):
         self.parent()
@@ -1386,12 +1493,29 @@ class SubagentCopyTests(unittest.TestCase):
 
         _, subs = self.export()
 
-        self.assertEqual(len(subs), 2)
-        self.assertEqual(sorted(c["source_file"] for c in subs), sorted([str(once_twice), str(twice_once)]))
+        # each has a message twice that the other has once: neither has all of the other
+        self.reconciles(subs, conversations=2, per_conversation=240, true_total=80)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(overlaps(by_file[str(once_twice)]), {str(twice_once): 3})
+        self.assertEqual(overlaps(by_file[str(twice_once)]), {str(once_twice): 3})
         for conversation in subs:
             self.assertNotIn("duplicate_source_files", conversation)
-            self.assertNotIn("reordered_source_files", conversation)
-            self.assertEqual(conversation["shared_prefix_with"][0]["shared_leading_messages"], 2)
+
+    def test_a_copy_with_a_line_twice_has_all_of_the_copy_with_it_once(self):
+        rows = self.rows(replies=2)
+        once = self.beside(rows)
+        twice = self.nested([rows[0], rows[1], rows[2], rows[2], rows[3]])
+
+        _, subs = self.export()
+
+        # the response written twice is exported twice, with one key
+        self.reconciles(subs, conversations=1, per_conversation=120, true_total=80)
+        self.assertEqual(subs[0]["source_file"], str(twice))
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(once), "shared_messages": 3, "order_matched": True}])
+        keys = [m["dedupe_key"] for m in subs[0]["messages"]]
+        self.assertEqual(keys[1], keys[2])
+        self.assertEqual(len(set(keys)), 3)
 
     def test_one_transcript_under_two_sessions_is_exported_for_each_and_each_names_the_other(self):
         self.parent("sess-1")
@@ -1404,8 +1528,8 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.reconciles(subs, conversations=2, per_conversation=240, true_total=120)
         by_session = {c["parent_session"]: c for c in subs}
-        self.assertEqual(by_session["sess-1"]["same_transcript_in"], [{"parent_session": "sess-2", "source_file": str(two)}])
-        self.assertEqual(by_session["sess-2"]["same_transcript_in"], [{"parent_session": "sess-1", "source_file": str(one)}])
+        self.assertEqual(by_session["sess-1"]["overlapping_source_files"], [{"source_file": str(two), "shared_messages": 4}])
+        self.assertEqual(by_session["sess-2"]["overlapping_source_files"], [{"source_file": str(one), "shared_messages": 4}])
         for conversation in subs:
             self.assertNotIn("duplicate_source_files", conversation)
         self.assertEqual({m["session_id"]: m["subagent_sessions"] for m in mains}, {"sess-1": ["x"], "sess-2": ["x"]})
@@ -1419,18 +1543,44 @@ class SubagentCopyTests(unittest.TestCase):
         self.reconciles(subs, conversations=3, per_conversation=120, true_total=40)
         for conversation in subs:
             others = sorted(s for s in files if s != conversation["parent_session"])
-            self.assertEqual(sorted(conversation["same_transcript_in"], key=lambda r: r["parent_session"]),
-                             [{"parent_session": s, "source_file": files[s]} for s in others])
+            self.assertEqual(conversation["overlapping_source_files"],
+                             [{"source_file": files[s], "shared_messages": 2} for s in others])
+
+    def test_a_shorter_copy_under_another_session_is_exported_and_both_say_what_they_share(self):
+        one = self.nested(self.rows(replies=2), "sess-1")
+        two = self.nested(self.rows(replies=3), "sess-2")
+
+        _, subs = self.export()
+
+        # sess-1 has nothing sess-2 does not have, and still keeps its sub-agent
+        self.reconciles(subs, conversations=2, per_conversation=200, true_total=120)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(by_session["sess-1"]["overlapping_source_files"], [{"source_file": str(two), "shared_messages": 3}])
+        self.assertEqual(by_session["sess-2"]["overlapping_source_files"], [{"source_file": str(one), "shared_messages": 3}])
+        for conversation in subs:
+            self.assertEqual(copy_fields(conversation), ["overlapping_source_files"])
+
+    def test_copies_that_part_ways_under_two_sessions_say_what_they_share(self):
+        rows = self.rows(replies=2)
+        one = self.nested(rows + [reply("left", "x-s1")], "sess-1")
+        two = self.nested(rows + [reply("right", "x-s1")], "sess-2")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=240, true_total=160)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(overlaps(by_session["sess-1"]), {str(two): 3})
+        self.assertEqual(overlaps(by_session["sess-2"]), {str(one): 3})
 
     def test_different_transcripts_under_two_sessions_do_not_name_each_other(self):
         self.nested(self.rows(replies=2), "sess-1")
-        self.nested(self.rows(replies=3), "sess-2")
+        self.nested(transcript("y", dict(COPY_USAGE), "sess-2", "x", replies=3), "sess-2")
 
         _, subs = self.export()
 
         self.reconciles(subs, conversations=2, per_conversation=200, true_total=200)
         for conversation in subs:
-            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+            self.assertEqual(copy_fields(conversation), [])
 
     def test_copies_without_entry_ids_are_still_never_merged(self):
         rows = self.rows(replies=3)
@@ -1443,9 +1593,12 @@ class SubagentCopyTests(unittest.TestCase):
 
         _, subs = self.export()
 
-        self.assertEqual(len(subs), 3)
+        # nothing says these are the same messages, so each is counted: 1 + 3 + 3 responses
+        self.reconciles(subs, conversations=3, per_conversation=280, true_total=280)
         for conversation in subs:
-            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+            self.assertEqual(copy_fields(conversation), [])
+            self.assertEqual([m["dedupe_key"] for m in conversation["messages"]],
+                             [f"{conversation['source_file']}#{n}" for n in range(len(conversation["messages"]))])
 
     def test_copies_that_cannot_be_compared_are_all_exported_without_copy_fields(self):
         rows = self.rows(replies=3)
@@ -1458,7 +1611,8 @@ class SubagentCopyTests(unittest.TestCase):
                     _, subs = self.export()
                 self.assertEqual(len(subs), 3)
                 for conversation in subs:
-                    self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+                    self.assertEqual(copy_fields(conversation), [])
+                self.assertEqual(len({m["dedupe_key"] for c in subs for m in c["messages"]}), 2 + 4 + 4)
 
     def test_the_session_itself_is_exported_the_same_whatever_copies_its_sub_agent_has(self):
         self.parent()
@@ -1472,10 +1626,11 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.assertEqual(mains[0].pop("subagent_sessions"), ["x"])
         self.assertEqual(json.dumps(mains[0], ensure_ascii=False), alone)
+        self.assertNotIn("dedupe_key", alone)
         # every response the files hold is in what was exported
         self.assertEqual({m["id"] for c in subs for m in c["messages"]}, {"x-u", "x-s0", "x-s1", "x-s2", "more"})
 
-    def test_an_exact_copy_is_only_listed_and_the_first_file_found_is_kept(self):
+    def test_an_exact_copy_is_only_listed_and_the_first_file_read_is_kept(self):
         rows = self.rows(replies=3)
         beside, nested = self.beside(rows), self.nested(rows)
 
@@ -1484,11 +1639,13 @@ class SubagentCopyTests(unittest.TestCase):
         self.reconciles(subs, conversations=1, per_conversation=120, true_total=120)
         self.assertEqual(subs[0]["source_file"], str(beside))
         self.assertEqual(subs[0]["duplicate_source_files"], [str(nested)])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(nested), "shared_messages": 4, "order_matched": True}])
         # nothing else is added to what a transcript found once has
         nested.unlink()
-        self.assertEqual(set(subs[0]) - set(self.export()[1][0]), {"duplicate_source_files"})
+        self.assertEqual(set(subs[0]) - set(self.export()[1][0]), {"duplicate_source_files", "contained_source_files"})
 
-    def test_a_longer_copy_carries_what_the_copy_it_replaces_had_recorded(self):
+    def test_a_longer_copy_records_every_file_it_has_all_of(self):
         rows = self.rows(replies=3)
         in_order = self.beside(rows)
         mixed = self.nested([rows[0], rows[1], rows[4], rows[2], rows[3]])
@@ -1499,11 +1656,9 @@ class SubagentCopyTests(unittest.TestCase):
         self.reconciles(subs, conversations=1, per_conversation=160, true_total=160)
         self.assertEqual(subs[0]["source_file"], str(longer))
         self.assertEqual(subs[0]["duplicate_source_files"], [str(in_order), str(mixed)])
-        self.assertEqual(subs[0]["prefix_source_files"],
-                         [{"source_file": str(in_order), "compared_with": str(longer), "shared_leading_messages": 4}])
-        # the copy in another order was compared with the file that is itself left out now
-        self.assertEqual(subs[0]["reordered_source_files"],
-                         [{"source_file": str(mixed), "compared_with": str(in_order), "kept_by": "parent_id_chain"}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(in_order), "shared_messages": 4, "order_matched": True},
+                          {"source_file": str(mixed), "shared_messages": 4, "order_matched": False}])
 
     def test_parent_ids_that_go_round_in_a_circle_do_not_stop_the_export(self):
         rows = self.rows(replies=1)
@@ -1517,16 +1672,30 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.assertEqual([[m["id"] for m in c["messages"]] for c in subs], [["x-u", "x-s0"]])
 
-    def test_one_transcript_under_two_sessions_as_two_agents_is_two_transcripts(self):
+    def test_one_transcript_under_two_sessions_as_two_agents_is_exported_for_each_and_each_names_the_other(self):
         rows = self.rows(replies=2)
-        self.nested(rows, "sess-1")
-        write_rows(self.project / "sess-2" / "subagents" / "agent-y.jsonl", rows)
+        one = self.nested(rows, "sess-1")
+        two = self.nested(rows, "sess-2", agent="y")
 
         _, subs = self.export()
 
-        self.assertEqual(sorted(c["agent"] for c in subs), ["x", "y"])
+        self.reconciles(subs, conversations=2, per_conversation=160, true_total=80)
+        self.assertEqual([c["agent"] for c in subs], ["x", "y"])
+        self.assertEqual(subs[0]["overlapping_source_files"], [{"source_file": str(two), "shared_messages": 3}])
+        self.assertEqual(subs[1]["overlapping_source_files"], [{"source_file": str(one), "shared_messages": 3}])
         for conversation in subs:
-            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+            self.assertEqual(copy_fields(conversation), ["overlapping_source_files"])
+
+    def test_one_transcript_as_two_agents_of_one_session_is_exported_for_each(self):
+        rows = self.rows(replies=2)
+        one = self.nested(rows)
+        two = self.nested(rows[:3], agent="y")
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=120, true_total=80)
+        self.assertEqual(overlaps(subs[0]), {str(two): 2})
+        self.assertEqual(overlaps(subs[1]), {str(one): 2})
 
     def test_one_transcript_under_two_sessions_in_two_orders_is_still_named_on_each(self):
         rows = self.rows(replies=3)
@@ -1537,8 +1706,8 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.reconciles(subs, conversations=2, per_conversation=240, true_total=120)
         by_session = {c["parent_session"]: c for c in subs}
-        self.assertEqual(by_session["sess-1"]["same_transcript_in"], [{"parent_session": "sess-2", "source_file": str(two)}])
-        self.assertEqual(by_session["sess-2"]["same_transcript_in"], [{"parent_session": "sess-1", "source_file": str(one)}])
+        self.assertEqual(by_session["sess-1"]["overlapping_source_files"], [{"source_file": str(two), "shared_messages": 4}])
+        self.assertEqual(by_session["sess-2"]["overlapping_source_files"], [{"source_file": str(one), "shared_messages": 4}])
 
     def test_a_transcript_whose_session_is_not_known_names_the_copy_under_a_session(self):
         rows = [{k: v for k, v in row.items() if k != "sessionId"} for row in self.rows(replies=2)]
@@ -1548,8 +1717,35 @@ class SubagentCopyTests(unittest.TestCase):
 
         self.reconciles(subs, conversations=2, per_conversation=160, true_total=80)
         by_session = {c["parent_session"]: c for c in subs}
-        self.assertEqual(by_session[None]["same_transcript_in"], [{"parent_session": "sess-1", "source_file": str(nested)}])
-        self.assertEqual(by_session["sess-1"]["same_transcript_in"], [{"parent_session": None, "source_file": str(beside)}])
+        self.assertEqual(by_session[None]["overlapping_source_files"], [{"source_file": str(nested), "shared_messages": 3}])
+        self.assertEqual(by_session["sess-1"]["overlapping_source_files"], [{"source_file": str(beside), "shared_messages": 3}])
+
+    def test_a_shorter_copy_whose_session_is_not_known_is_exported_and_names_the_longer_one(self):
+        rows = self.rows(replies=3)
+        beside = self.beside([{k: v for k, v in row.items() if k != "sessionId"} for row in rows[:4]])
+        nested = self.nested(rows)
+
+        _, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=200, true_total=120)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(overlaps(by_session[None]), {str(nested): 3})
+        self.assertEqual(overlaps(by_session["sess-1"]), {str(beside): 3})
+
+    def test_a_shorter_copy_that_names_another_session_is_exported_for_that_session(self):
+        self.parent("sess-1")
+        self.parent("sess-2")
+        rows = self.rows(replies=3, session_id="sess-2")
+        beside = self.beside(rows[:4])
+        nested = self.nested(rows, "sess-1")
+
+        mains, subs = self.export()
+
+        self.reconciles(subs, conversations=2, per_conversation=200, true_total=120)
+        by_session = {c["parent_session"]: c for c in subs}
+        self.assertEqual(overlaps(by_session["sess-2"]), {str(nested): 3})
+        self.assertEqual(overlaps(by_session["sess-1"]), {str(beside): 3})
+        self.assertEqual({m["session_id"]: m["subagent_sessions"] for m in mains}, {"sess-1": ["x"], "sess-2": ["x"]})
 
     def test_copies_with_empty_entry_ids_are_never_merged(self):
         rows = [dict(row, uuid="", parentUuid=None) for row in self.rows(replies=2)]
@@ -1558,9 +1754,9 @@ class SubagentCopyTests(unittest.TestCase):
 
         _, subs = self.export()
 
-        self.assertEqual(len(subs), 2)
+        self.reconciles(subs, conversations=2, per_conversation=160, true_total=160)
         for conversation in subs:
-            self.assertEqual([name for name in COPY_FIELDS if name in conversation], [])
+            self.assertEqual(copy_fields(conversation), [])
 
     def test_a_parent_id_that_names_nothing_in_the_file_does_not_count_against_an_order(self):
         rows = self.rows(replies=3)
@@ -1571,8 +1767,7 @@ class SubagentCopyTests(unittest.TestCase):
         _, subs = self.export()
 
         self.assertEqual([c["source_file"] for c in subs], [str(beside)])
-        self.assertEqual(subs[0]["reordered_source_files"],
-                         [{"source_file": str(nested), "compared_with": str(beside), "kept_by": "parent_id_chain"}])
+        self.assertEqual(subs[0]["duplicate_source_files"], [str(nested)])
 
     def test_an_entry_written_twice_is_in_order_once_it_has_been_seen(self):
         rows = self.rows(replies=3)
@@ -1583,8 +1778,8 @@ class SubagentCopyTests(unittest.TestCase):
         _, subs = self.export()
 
         self.assertEqual([c["source_file"] for c in subs], [str(beside)])
-        self.assertEqual(subs[0]["reordered_source_files"],
-                         [{"source_file": str(nested), "compared_with": str(beside), "kept_by": "parent_id_chain"}])
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(nested), "shared_messages": 5, "order_matched": False}])
 
     def test_the_kept_copy_keeps_its_own_meta_when_both_copies_have_one(self):
         rows = self.rows(replies=2)
@@ -1598,7 +1793,7 @@ class SubagentCopyTests(unittest.TestCase):
         self.assertEqual(subs[0]["agent_type"], "from-the-full-copy")
         self.assertEqual(subs[0]["agent_description"], "only the short copy says this")
 
-    def test_a_copy_is_compared_with_every_file_found_before_it(self):
+    def test_a_copy_is_compared_with_every_file_of_the_project(self):
         rows = self.rows(replies=2)
         other = self.beside([reply("other", None)])
         first = self.nested(rows)
@@ -1607,4 +1802,345 @@ class SubagentCopyTests(unittest.TestCase):
         _, subs = self.export()
 
         self.assertEqual(sorted(c["source_file"] for c in subs), sorted([str(other), str(first)]))
-        self.assertEqual([c.get("duplicate_source_files") for c in subs], [None, [str(second)]])
+
+
+def thread(count, prefix="x", after=None, first=0, session_id="sess-1"):
+    """A prompt (when nothing comes before) and `count` responses, each with output tokens no sum of others gives"""
+    rows = [] if after else [{"type": "user", "uuid": f"{prefix}-u", "parentUuid": None, "timestamp": TS, "cwd": "/work",
+                              "sessionId": session_id, "agentId": "x", "isSidechain": True,
+                              "message": {"role": "user", "content": f"{prefix} prompt"}}]
+    parent = after or f"{prefix}-u"
+    for n in range(first, first + count):
+        rows.append(reply(f"{prefix}-{n}", parent, {"input_tokens": 1, "output_tokens": 2 ** n}, session_id))
+        parent = f"{prefix}-{n}"
+    return rows
+
+
+def shuffled(rows, rng):
+    """The same rows in an order that is not theirs"""
+    mixed = list(rows)
+    while mixed == rows:
+        rng.shuffle(mixed)
+    return mixed
+
+
+COPY_KINDS = ("full", "prefix", "reordered", "reordered-prefix", "diverging", "reordered-diverging")
+COPY_PLACES = ("same", "same", "same", "other-session", "other-agent")
+
+
+def generated_copies(seed):
+    """2 to 5 copies of one transcript: [(kind, rows, session, agent)], the first always under sess-1 as agent x"""
+    rng = random.Random(seed)
+    base = thread(rng.randint(3, 6))
+    copies, bit = [], 10
+    for number in range(2 + seed % 4):
+        kind = rng.choice(COPY_KINDS)
+        rows = base
+        if "prefix" in kind:
+            rows = base[:rng.randint(2, len(base) - 1)]
+        if "diverging" in kind:
+            stem = base[:rng.randint(2, len(base))]
+            own = rng.randint(1, 2)
+            rows = stem + thread(own, f"fork{number}", after=stem[-1]["uuid"], first=bit)
+            bit += own
+        if "reordered" in kind:
+            rows = shuffled(rows, rng)
+        place = rng.choice(COPY_PLACES) if number else "same"
+        copies.append((f"{kind} {place}", rows, "sess-2" if place == "other-session" else "sess-1",
+                       "y" if place == "other-agent" else "x"))
+    return copies
+
+
+def count_of_each(items):
+    counts = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    return counts
+
+
+def shared_count(one, other):
+    """How many messages two lists of entry ids have in common, an id both have twice counting twice"""
+    one, other = count_of_each(one), count_of_each(other)
+    return sum(min(times, other.get(uuid, 0)) for uuid, times in one.items())
+
+
+def met_in_order(part, whole):
+    position = 0
+    for uuid in part:
+        if uuid not in whole[position:]:
+            return False
+        position = whole.index(uuid, position) + 1
+    return True
+
+
+class SubagentCopyGroupingTests(unittest.TestCase):
+    """Any number of files that hold some of one transcript: one outcome, whatever the files are called"""
+
+    setUp = ExtractClaudeCodeSubagentTests.setUp
+    parent = ExtractClaudeCodeSubagentTests.parent
+    export = ExtractClaudeCodeSubagentTests.export
+    nested = SubagentCopyTests.nested
+    beside = SubagentCopyTests.beside
+
+    def place(self, copies, names):
+        """Write each copy under its session as its agent, in the directory named for it; returns {path: copy}"""
+        shutil.rmtree(self.project)
+        self.project.mkdir()
+        self.parent("sess-1")
+        self.parent("sess-2")
+        return {str(self.nested(rows, session, name, agent)): (rows, session, agent)
+                for (_, rows, session, agent), name in zip(copies, names)}
+
+    def outcome(self, written):
+        """Check everything the export says against the files written; returns what must not depend on their names"""
+        mains, subs = self.export()
+        ids = {path: [row["uuid"] for row in rows] for path, (rows, _, _) in written.items()}
+        owner = {path: (session, agent) for path, (_, session, agent) in written.items()}
+        exported = {c["source_file"]: c for c in subs}
+        self.assertEqual(len(exported), len(subs))
+        self.assertLessEqual(set(exported), set(written))
+
+        # the four sums
+        true_total = output_written(*(rows for rows, _, _ in written.values()))
+        self.assertEqual(output_by_dedupe_key(subs), true_total)
+        self.assertEqual(output_by_message(subs), true_total)
+        self.assertGreaterEqual(output_per_conversation(subs), true_total)
+        # nothing a file holds is missing from the export
+        self.assertEqual({m["id"] for c in subs for m in c["messages"]}, {uuid for path in ids for uuid in ids[path]})
+        for path, conversation in exported.items():
+            self.assertEqual([m["id"] for m in conversation["messages"]], ids[path])
+            self.assertEqual((conversation["parent_session"], conversation["agent"]), owner[path])
+            self.assertEqual(all("dedupe_key" in m for m in conversation["messages"]), True)
+
+        # a file is exported or recorded once, on a conversation of its session and agent that has all of it
+        recorded = {}
+        for path, conversation in exported.items():
+            records = conversation.get("contained_source_files", [])
+            self.assertEqual(conversation.get("duplicate_source_files", []), [r["source_file"] for r in records])
+            for record in records:
+                left_out = record["source_file"]
+                self.assertNotIn(left_out, recorded)
+                self.assertNotIn(left_out, exported)
+                recorded[left_out] = (path, record)
+                self.assertEqual(owner[left_out], owner[path])
+                self.assertEqual(record["shared_messages"], len(ids[left_out]))
+                self.assertEqual(shared_count(ids[left_out], ids[path]), len(ids[left_out]))
+                self.assertEqual(record["order_matched"], met_in_order(ids[left_out], ids[path]))
+                have_it_all = [other for other in exported
+                               if shared_count(ids[left_out], ids[other]) == len(ids[left_out])]
+                self.assertEqual(sorted([path] + record.get("also_in", [])), sorted(have_it_all))
+                self.assertEqual("also_in" in record, len(have_it_all) > 1)
+                # recorded on the one with the most messages
+                self.assertEqual(len(ids[path]), max(len(ids[other]) for other in have_it_all if owner[other] == owner[path]))
+        self.assertEqual(sorted(list(exported) + list(recorded)), sorted(written))
+        for path in exported:
+            # no exported conversation has all of another of its own session and agent
+            for other in exported:
+                if other != path and owner[other] == owner[path]:
+                    self.assertLess(shared_count(ids[path], ids[other]), len(ids[path]))
+            # and each names every exported conversation it shares a message with
+            sharing = {other: shared_count(ids[path], ids[other]) for other in exported if other != path}
+            self.assertEqual(overlaps(exported[path]), {other: n for other, n in sharing.items() if n})
+            self.assertEqual(len(exported[path].get("overlapping_source_files", [])), len(overlaps(exported[path])))
+        # a session and agent that has a file has a conversation
+        self.assertEqual({owner[path] for path in exported}, set(owner.values()))
+        self.assertEqual({m["session_id"]: m["subagent_sessions"] for m in mains if "subagent_sessions" in m},
+                         {session: sorted({a for s, a in owner.values() if s == session})
+                          for session in {s for s, _ in owner.values()}})
+
+        def content(path):
+            return (owner[path], tuple(sorted(ids[path])))
+
+        return {"exported": sorted(content(path) for path in exported),
+                "left out": sorted((content(left_out), record["shared_messages"],
+                                    sorted(content(p) for p in [path] + record.get("also_in", [])))
+                                   for left_out, (path, record) in recorded.items()),
+                "overlapping": sorted((content(path), content(other), n)
+                                      for path in exported for other, n in overlaps(exported[path]).items()),
+                "sums": (output_by_dedupe_key(subs), output_by_message(subs), true_total)}
+
+    def test_generated_copies_reconcile_whatever_their_directories_are_called(self):
+        names = ["", "a", "b", "c", "d"]
+        kinds = set()
+        for seed in range(48):
+            copies = generated_copies(seed)
+            kinds.update(word for kind, _, _, _ in copies for word in kind.split())
+            orders = list(itertools.permutations(names[:len(copies)])) if len(copies) <= 4 else [names, names[::-1]]
+            with self.subTest(seed=seed, copies=[kind for kind, _, _, _ in copies]):
+                outcomes = [self.outcome(self.place(copies, order)) for order in orders]
+                for order, outcome in zip(orders, outcomes):
+                    self.assertEqual(outcome, outcomes[0], order)
+        # what was generated did mix every kind of copy
+        self.assertEqual(kinds, {"full", "prefix", "reordered", "reordered-prefix", "diverging", "reordered-diverging",
+                                 "same", "other-session", "other-agent"})
+
+    def test_three_copies_reconcile_whichever_directories_they_are_in(self):
+        rows = thread(5)
+        mixed = [rows[3], rows[1], rows[2], rows[0]]
+        copies = [("full", rows, "sess-1", "x"), ("reordered-prefix", mixed, "sess-1", "x"),
+                  ("prefix", rows[:4], "sess-1", "x")]
+        for order in itertools.permutations(["", "a", "b"]):
+            with self.subTest(order=order):
+                written = self.place(copies, order)
+                outcome = self.outcome(written)
+                full = next(path for path, (copy, _, _) in written.items() if copy is rows)
+                _, subs = self.export()
+                # 1 + 2 + 4 + 8 + 16 output tokens were spent, and that is what the one conversation says
+                self.assertEqual([c["source_file"] for c in subs], [full])
+                self.assertEqual(output_per_conversation(subs), 31)
+                self.assertEqual(outcome["sums"], (31, 31, 31))
+                self.assertEqual(sorted(r["order_matched"] for r in subs[0]["contained_source_files"]), [False, True])
+
+    def test_a_full_copy_beside_the_sessions_and_two_partial_copies_under_the_session_are_one_conversation(self):
+        self.parent()
+        rows = thread(5)
+        full = self.beside(rows)
+        mixed = self.nested([rows[3], rows[1], rows[2], rows[0]], under="a")
+        short = self.nested(rows[:4], under="b")
+
+        _, subs = self.export()
+
+        self.assertEqual([c["source_file"] for c in subs], [str(full)])
+        self.assertEqual(output_per_conversation(subs), 31)
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(mixed), "shared_messages": 4, "order_matched": False},
+                          {"source_file": str(short), "shared_messages": 4, "order_matched": True}])
+
+    def test_a_copy_in_another_order_has_all_of_a_shorter_copy(self):
+        rows = thread(5)
+        short = self.beside(rows[:4])
+        mixed = self.nested([rows[5], rows[1], rows[2], rows[3], rows[4], rows[0]])
+
+        _, subs = self.export()
+
+        self.assertEqual([c["source_file"] for c in subs], [str(mixed)])
+        self.assertEqual(output_per_conversation(subs), 31)
+        self.assertEqual(subs[0]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 4, "order_matched": False}])
+
+    def test_a_copy_in_another_order_and_a_copy_that_goes_another_way_say_what_they_share(self):
+        rows = thread(4)
+        mixed = self.beside([rows[4], rows[1], rows[2], rows[3], rows[0]])
+        forked = self.nested(rows[:3] + thread(1, "fork", after="x-1", first=8))
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 2)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(overlaps(by_file[str(mixed)]), {str(forked): 3})
+        self.assertEqual(overlaps(by_file[str(forked)]), {str(mixed): 3})
+        self.assertEqual(output_per_conversation(subs), 15 + 3 + 256)
+        self.assertEqual(output_by_dedupe_key(subs), 15 + 256)
+        self.assertEqual(output_by_message(subs), 15 + 256)
+
+    def test_two_conversations_hold_what_their_lengths_and_shared_count_say(self):
+        rows = thread(4)
+        self.beside(rows[:3] + thread(2, "left", after="x-1", first=8))
+        self.nested(rows + thread(1, "right", after="x-3", first=12))
+
+        _, subs = self.export()
+
+        (shared,) = set(overlaps(subs[0]).values()) | set(overlaps(subs[1]).values())
+        different = len({m["dedupe_key"] for c in subs for m in c["messages"]})
+        self.assertEqual(len(subs[0]["messages"]) + len(subs[1]["messages"]) - shared, different)
+        self.assertEqual(different, 8)
+
+    def test_three_conversations_that_share_with_one_another_are_counted_by_key_not_by_shared_counts(self):
+        rows = thread(3)
+        for number, name in enumerate(("", "a", "b")):
+            self.nested(rows + thread(1, f"fork{number}", after="x-2", first=8 + number), under=name)
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 3)
+        pairs = sum(n for c in subs for n in overlaps(c).values()) // 2
+        different = len({m["dedupe_key"] for c in subs for m in c["messages"]})
+        self.assertEqual(different, 4 + 3)
+        # the four messages all three hold are taken off three times, where twice would be right
+        self.assertEqual(sum(len(c["messages"]) for c in subs) - pairs, different - 4)
+        self.assertEqual(output_per_conversation(subs), 3 * 7 + 256 + 512 + 1024)
+        self.assertEqual(output_by_dedupe_key(subs), 7 + 256 + 512 + 1024)
+        self.assertEqual(output_by_message(subs), 7 + 256 + 512 + 1024)
+
+    def test_the_order_a_directory_lists_its_files_in_changes_nothing(self):
+        self.parent()
+        rows = thread(5)
+        self.beside(rows[:3] + thread(1, "fork", after="x-1", first=9))
+        self.nested([rows[3], rows[1], rows[2], rows[0]], under="a")
+        self.nested(rows[:4], under="b")
+        self.nested(rows, under="c")
+        self.nested(rows, "sess-2")
+        self.nested(rows[:2], agent="y")
+        listed = Path.glob
+
+        def as_listed(mains, subs):
+            return [json.dumps(c, sort_keys=True) for c in mains], [json.dumps(c, sort_keys=True) for c in subs]
+
+        expected = as_listed(*self.export())
+        for name, order in (("backwards", lambda found: found[::-1]),
+                            ("shuffled", lambda found: random.Random(5).sample(found, len(found)))):
+            with self.subTest(order=name):
+                with mock.patch.object(Path, "glob", lambda path, pattern: iter(order(sorted(listed(path, pattern))))):
+                    self.assertEqual(as_listed(*self.export()), expected)
+
+    def test_every_sub_agent_message_has_a_key_and_a_message_of_the_session_has_none(self):
+        self.parent()
+        rows = thread(3)
+        self.nested(rows)
+        self.nested(rows[:3], "sess-2")
+
+        mains, subs = self.export()
+
+        self.assertEqual([m for c in mains for m in c["messages"] if "dedupe_key" in m], [])
+        keys = [[m["dedupe_key"] for m in c["messages"]] for c in subs]
+        self.assertEqual(keys[1], keys[0][:3])
+        self.assertEqual(len(set(keys[0])), 4)
+        # the key is the digest of the message as it is exported without the key
+        for conversation in subs:
+            for message in conversation["messages"]:
+                rest = {k: v for k, v in message.items() if k != "dedupe_key"}
+                self.assertEqual(message["dedupe_key"],
+                                 hashlib.sha256(json.dumps([rest], sort_keys=True).encode()).hexdigest())
+
+    def test_the_same_entry_id_with_other_content_is_another_message(self):
+        rows = thread(3)
+        changed = json.loads(json.dumps(rows[:3]))
+        changed[2]["message"]["content"][0]["text"] = "said differently"
+        one = self.beside(changed)
+        two = self.nested(rows)
+
+        _, subs = self.export()
+
+        # x-1 was written two ways: both are exported and both count
+        self.assertEqual(len(subs), 2)
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(overlaps(by_file[str(one)]), {str(two): 2})
+        self.assertEqual(output_by_dedupe_key(subs), 1 + 2 + 4 + 2)
+        self.assertEqual(output_by_message(subs), 1 + 2 + 4 + 2)
+
+    def test_a_file_left_out_gives_its_meta_and_the_first_read_is_asked_first(self):
+        rows = thread(3)
+        self.nested(rows, under="z")
+        for name, kind in (("a", "from-a"), ("b", "from-b")):
+            self.nested(rows[:2], under=name).with_name("agent-x.meta.json").write_text(json.dumps({"agentType": kind}))
+
+        _, subs = self.export()
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["agent_type"], "from-a")
+
+    def test_a_copy_under_another_session_is_named_beside_the_file_that_records_a_left_out_copy(self):
+        rows = thread(3)
+        short = self.beside(rows[:3])
+        full = self.nested(rows)
+        elsewhere = self.nested(rows, "sess-2")
+
+        _, subs = self.export()
+
+        by_file = {c["source_file"]: c for c in subs}
+        self.assertEqual(sorted(by_file), sorted([str(full), str(elsewhere)]))
+        self.assertEqual(by_file[str(full)]["contained_source_files"],
+                         [{"source_file": str(short), "shared_messages": 3, "order_matched": True,
+                           "also_in": [str(elsewhere)]}])
+        self.assertNotIn("contained_source_files", by_file[str(elsewhere)])
+        self.assertEqual(output_by_dedupe_key(subs), 7)

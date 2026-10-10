@@ -9,6 +9,7 @@ Auto-discovers Claude Code installations on the device
 
 import json
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 import hashlib
@@ -171,7 +172,7 @@ def _follows_parent_chain(conversation):
 
 
 def _comparable_copy(conversation, nested):
-    """What is needed to compare a sub-agent conversation with another copy of it, or None
+    """What is needed to compare a sub-agent conversation with the others of its project, or None
 
     None when its messages carry no real entry ids (two such transcripts cannot be told
     apart) or cannot be digested; such a conversation is exported as it is, never merged.
@@ -184,65 +185,82 @@ def _comparable_copy(conversation, nested):
     except (RecursionError, TypeError, ValueError):
         return None
     return {'conversation': conversation, 'digests': digests, 'nested': nested,
+            'owner': (conversation['parent_session'], conversation['agent']),
             'in_chain_order': _follows_parent_chain(conversation)}
 
 
-def _shared_leading(first, second):
-    """How many messages two copies have in common from the start, by digest"""
-    shared = 0
-    for one, other in zip(first, second):
-        if one != other:
-            break
-        shared += 1
-    return shared
+def _in_same_order(part, whole):
+    """Whether every message of one copy is met in the other in the order the copy has them"""
+    rest = iter(whole)
+    return all(digest in rest for digest in part)
 
 
-def _same_transcript(old, new):
-    """Whether two copies of one agent's transcript in one session are the same transcript
+def _reconcile_copies(copies):
+    """Decide, for all comparable sub-agent conversations of one project at once, which are exported
 
-    Returns None when they are not, else (kept, left out, field, record): the record goes
-    into the kept conversation's list `field`; an exact copy has no record. `old` was found
-    first.
+    `copies` are in the order their files were read, which is a sorted order. Each is compared
+    by the multiset of its message digests with every other that shares a message. Returns the
+    conversations that are not exported; the fields this writes on the others are described on
+    extract_claude_project_conversations. Nothing here depends on the order of `copies` except
+    where a tie is said to be broken by it.
     """
-    first, second = old['digests'], new['digests']
-    if first == second:
-        return old, new, None, None
-    shared = _shared_leading(first, second)
-    if shared == min(len(first), len(second)):
-        # One stops where the other goes on: a file copied while it was still being written
-        kept, left_out = (old, new) if len(first) > len(second) else (new, old)
-        return kept, left_out, 'prefix_source_files', {'shared_leading_messages': shared}
-    if sorted(first) == sorted(second):
-        # The same messages, each as many times, in another order
-        if old['in_chain_order'] != new['in_chain_order']:
-            kept, rule = (old if old['in_chain_order'] else new), 'parent_id_chain'
-        elif old['nested'] != new['nested']:
-            kept, rule = (old if old['nested'] else new), 'nested_layout'
-        else:
-            kept, rule = old, 'first_found'
-        return kept, (new if kept is old else old), 'reordered_source_files', {'kept_by': rule}
-    return None
+    holders = {}
+    for index, copy in enumerate(copies):
+        copy.update(index=index, bag=Counter(copy['digests']), shared={})
+        for digest in copy['bag']:
+            holders.setdefault(digest, []).append(copy)
+    for copy in copies:
+        for digest, times in copy['bag'].items():
+            for other in holders[digest]:
+                if other is not copy:
+                    copy['shared'][other['index']] = (copy['shared'].get(other['index'], 0)
+                                                      + min(times, other['bag'][digest]))
 
+    # Files of one session and agent with the same messages in the same order are one choice
+    same_order = {}
+    for copy in copies:
+        same_order.setdefault((copy['owner'], tuple(copy['digests'])), []).append(copy)
+    for alike in same_order.values():
+        nested = any(copy['nested'] for copy in alike)
+        for copy in alike:
+            # More messages first; of equals, the one in the order of its parent ids, then one
+            # found under <session-id>/subagents/, then the first read
+            copy['rank'] = (-len(copy['digests']), not copy['in_chain_order'], not nested, copy['index'])
 
-COPY_RECORD_FIELDS = ('prefix_source_files', 'reordered_source_files')
+    for copy in copies:
+        # Everything this copy has, the other has too
+        copy['held_by'] = [copies[index] for index, shared in sorted(copy['shared'].items())
+                           if shared == len(copy['digests'])]
+        copy['left_out'] = any(other['owner'] == copy['owner'] and other['rank'] < copy['rank']
+                               for other in copy['held_by'])
 
+    for copy in copies:
+        if not copy['left_out']:
+            continue
+        exported = [other for other in copy['held_by'] if not other['left_out']]
+        # A session never loses its sub-agent: only a conversation of the same session and agent stands for it
+        kept = min((other for other in exported if other['owner'] == copy['owner']),
+                   key=lambda other: (-len(other['digests']), other['index']))
+        conversation, left_out = kept['conversation'], copy['conversation']
+        record = {'source_file': left_out['source_file'], 'shared_messages': len(copy['digests']),
+                  'order_matched': _in_same_order(copy['digests'], kept['digests'])}
+        also_in = [other['conversation']['source_file'] for other in exported if other is not kept]
+        if also_in:
+            record['also_in'] = also_in
+        conversation.setdefault('duplicate_source_files', []).append(left_out['source_file'])
+        conversation.setdefault('contained_source_files', []).append(record)
+        # The meta file sits beside only one of the copies
+        for name in META_FIELDS.values():
+            if name in left_out:
+                conversation.setdefault(name, left_out[name])
 
-def _leave_out(kept, left_out, field, record):
-    """Record on the kept conversation the copy that is not exported, and all that copy stood for"""
-    conversation, other = kept['conversation'], left_out['conversation']
-    conversation.setdefault('duplicate_source_files', []).append(other['source_file'])
-    conversation['duplicate_source_files'].extend(other.get('duplicate_source_files', []))
-    if record is not None:
-        # 'compared_with' is the kept file now; it stays true if another copy later replaces that one
-        conversation.setdefault(field, []).append(
-            {'source_file': other['source_file'], 'compared_with': conversation['source_file'], **record})
-    for name in COPY_RECORD_FIELDS:
-        if other.get(name):
-            conversation.setdefault(name, []).extend(other[name])
-    # The meta file sits beside only one of the copies
-    for name in META_FIELDS.values():
-        if name in other:
-            conversation.setdefault(name, other[name])
+    for copy in copies:
+        overlapping = [{'source_file': copies[index]['conversation']['source_file'], 'shared_messages': shared}
+                       for index, shared in sorted(copy['shared'].items()) if not copies[index]['left_out']]
+        if overlapping and not copy['left_out']:
+            copy['conversation']['overlapping_source_files'] = overlapping
+
+    return [copy['conversation'] for copy in copies if copy['left_out']]
 
 
 META_FILE_LIMIT = 64 * 1024
@@ -461,32 +479,51 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
     linked to its session by 'parent_session'; the session lists its sub-agents in
     'subagent_sessions' whether or not they are exported.
 
-    One transcript can be found in several files. Copies are compared message by message,
-    by content, and only when every message has an entry id:
+    One transcript can be found in several files, whole, cut short, in another order or carried
+    on differently. So every message of a sub-agent conversation has a 'dedupe_key': the digest
+    of what the message says, entry id included (the SHA-256 of the exported message without
+    this field, as JSON with sorted keys in a list of one). Two messages with the same key are
+    the same message, wherever they are; a line written twice in a file gives the same key twice.
 
-    - Files for the same session and agent that hold the same transcript are exported once,
-      and the files left out are listed in 'duplicate_source_files'. That covers a copy that
-      is the same, a copy that stops early ('prefix_source_files' on the longer one that is
-      kept: each file and its 'shared_leading_messages'), and a copy with the same messages,
-      each as many times, in another order ('reordered_source_files': each file and
-      'kept_by', the rule that chose the kept one: 'parent_id_chain' when only it has no
-      message before its parent, else 'nested_layout' for the copy under <session-id>/subagents/,
-      else 'first_found'). Each of those records names in 'compared_with' the file it was
-      compared with, which is the exported one unless that file was itself left out later.
-    - Files for the same session and agent that begin alike and then differ are all
-      exported; each lists the others in 'shared_prefix_with' ('source_file' and
-      'shared_leading_messages').
-    - The same transcript (the same messages, in any order) for the same agent under different
-      sessions of a project is exported for each; each lists the others in
-      'same_transcript_in' ('parent_session' and 'source_file').
+    To count every sub-agent message once, count a 'dedupe_key' the first time it is seen and
+    not again: usage summed over distinct keys is exact for any number of files, sessions and
+    agents. That is the method to use.
 
-    To count every message once: skip a conversation when 'same_transcript_in' names a
-    'source_file' that sorts before its own; otherwise skip its first n messages, n being the
-    largest 'shared_leading_messages' in 'shared_prefix_with' among files that sort before it.
+    The conversations of a project that hold some of the same messages are found in one pass
+    over all of its sub-agent files, read in sorted order, by comparing how many times each
+    conversation has each key:
+
+    - A conversation that has nothing another conversation of the same session and agent
+      does not have (the same file again, a copy that stops early, the same messages in
+      another order, or both) is not exported. The file is listed in 'duplicate_source_files'
+      and described in 'contained_source_files' of an exported conversation that has all of
+      it: 'source_file', 'shared_messages' (how many messages it has) and 'order_matched'
+      (whether they come in the same order there). When several exported conversations of that
+      session and agent have all of it, it is recorded on the one with the most messages, the
+      first read of those with as many, and 'also_in' names the others, with any exported
+      conversation of another session or agent that has all of it too.
+      Of files with the same messages as many times, the one exported is the one with no
+      message before its parent, else one whose order is found under <session-id>/subagents/,
+      else the first read. Files beside the sessions are read first, then the others by path.
+    - Conversations that share messages and are all exported each list the others in
+      'overlapping_source_files': 'source_file' and 'shared_messages', the number of messages
+      the two have in common, a message that both have twice counting twice.
+    - A conversation of another session or of another agent is never left out for it, however
+      much they share, and neither is one whose session is not known: a session keeps its
+      sub-agent. They are exported and list each other in 'overlapping_source_files'.
+
+    Two conversations a and b hold len(a) + len(b) - shared_messages different messages when
+    neither repeats a message. The counts alone do not give that for three or more
+    conversations that share with one another, because what all three hold is taken off once
+    too often and no pair says how much that is; 'dedupe_key' does.
+
+    A conversation with a message that has no entry id, or that cannot be digested, is not
+    compared: none of the fields above is written for it, and each of its messages has a
+    'dedupe_key' made of its file and position, which no other message has.
 
     Every name taken from a file or directory ('session_id', 'agent', 'parent_session',
     'subagent_sessions', 'project_name', 'source_file', 'duplicate_source_files',
-    'installation', and 'source_file' and 'parent_session' in the fields above) is written by
+    'installation', and 'source_file' and 'also_in' in the fields above) is written by
     _name: unchanged when it is text, escaped when it is not.
     """
     project_dir = Path(project_dir)
@@ -519,7 +556,8 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
                 sessions[conversation['session_id']] = conversation
 
         agents_of = {}
-        copies = {}  # (parent session, agent) -> the exported copies that can be compared
+        found = []
+        copies = []  # the sub-agent conversations of this project that can be compared
         for agent_file, parent_session in subagent_files:
             nested = parent_session is not None
             agent = _name(agent_file.stem[len('agent-'):])
@@ -532,51 +570,18 @@ def extract_claude_project_conversations(project_dir, include_subagents=True):
             if conversation:
                 conversation.update(subagent=True, agent=agent, parent_session=parent_session,
                                     **_agent_meta(agent_file))
-                # The same transcript can sit in both layouts; exported twice, its usage counts twice
+                # The same transcript can sit in several files; exported for each, its usage counts for each
                 copy = _comparable_copy(conversation, nested)
                 if copy is not None:
-                    kept_copies = copies.setdefault((parent_session, agent), [])
-                    for old in list(kept_copies):
-                        same = _same_transcript(old, copy)
-                        if same is None:
-                            continue
-                        kept, left_out, field, record = same
-                        _leave_out(kept, left_out, field, record)
-                        if kept is old:
-                            copy = None
-                            break
-                        kept_copies[:] = [c for c in kept_copies if c is not old]
-                        subagent_conversations[:] = [c for c in subagent_conversations
-                                                     if c is not old['conversation']]
-                    if copy is None:
-                        continue
-                    kept_copies.append(copy)
-                subagent_conversations.append(conversation)
+                    copies.append(copy)
+                for index, message in enumerate(conversation['messages']):
+                    # Not part of what is compared: the digest was taken before this was added
+                    message['dedupe_key'] = (copy['digests'][index] if copy is not None
+                                             else f"{conversation['source_file']}#{index}")
+                found.append(conversation)
 
-        for kept_copies in copies.values():
-            # Copies that begin alike and then differ are both exported; each says how far they agree
-            for index, one in enumerate(kept_copies):
-                for other in kept_copies[index + 1:]:
-                    shared = _shared_leading(one['digests'], other['digests'])
-                    if not shared:
-                        continue
-                    for here, there in ((one, other), (other, one)):
-                        here['conversation'].setdefault('shared_prefix_with', []).append(
-                            {'source_file': there['conversation']['source_file'],
-                             'shared_leading_messages': shared})
-
-        # One transcript under two sessions is exported for each; each says where the other is
-        same_everywhere = {}
-        for (_, agent), kept_copies in copies.items():
-            for copy in kept_copies:
-                # As within a session, the same messages in another order are the same transcript
-                same_everywhere.setdefault((agent, tuple(sorted(copy['digests']))), []).append(copy['conversation'])
-        for group in same_everywhere.values():
-            for conversation in group:
-                others = [{'parent_session': other['parent_session'], 'source_file': other['source_file']}
-                          for other in group if other is not conversation]
-                if others:
-                    conversation['same_transcript_in'] = others
+        left_out = {id(c) for c in _reconcile_copies(copies)}
+        subagent_conversations.extend(c for c in found if id(c) not in left_out)
 
         # A sub-agent's usage is not in its session's transcript; say that it exists
         for parent_session, agents in agents_of.items():
