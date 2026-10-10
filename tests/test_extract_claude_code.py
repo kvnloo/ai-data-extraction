@@ -100,3 +100,50 @@ class ExtractClaudeCodeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+USAGE = {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 3, "cache_read_input_tokens": 7}
+
+IDENTIFIED = [
+    {"type": "user", "uuid": "u1", "parentUuid": None, "timestamp": TS, "cwd": "/work",
+     "message": {"role": "user", "content": "go"}},
+    {"type": "attachment", "uuid": "a1", "parentUuid": "u1", "timestamp": TS,
+     "attachment": {"type": "hook_additional_context", "hookEvent": "UserPromptSubmit", "content": ["memory"]}},
+    {"type": "attachment", "uuid": "a2", "parentUuid": "a1", "timestamp": TS, "attachment": {"type": "date"}},
+    {"type": "attachment", "uuid": "a3", "parentUuid": "a2", "timestamp": TS, "attachment": {"type": "date"}},
+    # One model response written as two entries: both carry the same message id and usage.
+    {"type": "assistant", "uuid": "s1", "parentUuid": "a3", "timestamp": TS, "requestId": "req_1",
+     "message": {"id": "msg_1", "role": "assistant", "model": "claude-x", "usage": USAGE,
+                 "content": [{"type": "text", "text": "Looking."}]}},
+    {"type": "assistant", "uuid": "s2", "parentUuid": "s1", "timestamp": TS, "requestId": "req_1",
+     "message": {"id": "msg_1", "role": "assistant", "model": "claude-x", "usage": USAGE,
+                 "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}]}},
+    {"type": "user", "uuid": "u2", "parentUuid": "s2", "timestamp": TS,
+     "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.py"}]}},
+]
+
+
+class ExtractClaudeCodeProvenanceTests(ExtractClaudeCodeTests):
+    def test_every_message_names_its_source_entry_and_parent(self):
+        messages = self.conversation(IDENTIFIED)["messages"]
+        self.assertEqual([m["id"] for m in messages], ["u1", "a1", "s1", "s2", "u2"])
+        self.assertEqual([m["parent_id"] for m in messages], [None, "u1", "a3", "s1", "s2"])
+
+    def test_usage_is_exported_with_the_ids_needed_to_count_it_once(self):
+        assistant = [m for m in self.conversation(IDENTIFIED)["messages"] if m["role"] == "assistant"]
+        self.assertEqual([m["usage"] for m in assistant], [USAGE, USAGE])
+        # Two entries, one response: a consumer must dedupe on message_id before summing.
+        self.assertEqual({m["message_id"] for m in assistant}, {"msg_1"})
+        self.assertEqual({m["request_id"] for m in assistant}, {"req_1"})
+
+    def test_attachments_left_out_are_counted_by_type(self):
+        conversation = self.conversation(IDENTIFIED)
+        self.assertEqual(conversation["omitted_attachments"], {"date": 2})
+        self.assertNotIn("hook_additional_context", conversation["omitted_attachments"])
+
+    def test_entries_without_identity_export_as_before(self):
+        messages = self.conversation()["messages"]  # SESSION has uuids but no parents, usage or message ids
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        self.assertNotIn("usage", assistant)
+        self.assertNotIn("message_id", assistant)
+        self.assertIsNone(assistant["parent_id"])

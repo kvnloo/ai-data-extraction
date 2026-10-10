@@ -69,6 +69,14 @@ def find_claude_installations():
     return list(dict.fromkeys(locations))  # Remove duplicates, keep discovery order
 
 
+USAGE_KEYS = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')
+
+
+def _identity(obj):
+    """Source entry identity, so an exported message can be traced back to the transcript"""
+    return {'id': obj.get('uuid'), 'parent_id': obj.get('parentUuid')}
+
+
 def _block_text(content):
     """Text of a tool result, which is either a string or a list of text blocks"""
     if isinstance(content, str):
@@ -99,6 +107,7 @@ def extract_claude_project_conversations(project_dir):
     for jsonl_file in jsonl_files:
         try:
             messages = []
+            omitted_attachments = {}
             session_id = jsonl_file.stem
             project_path = None
             project_name = jsonl_file.parent.name if jsonl_file.parent.name != 'projects' else None
@@ -125,7 +134,8 @@ def extract_claude_project_conversations(project_dir):
                                             'tool_call_id': item.get('tool_use_id'),
                                             'content': _block_text(item.get('content')),
                                             'is_error': bool(item.get('is_error')),
-                                            'timestamp': obj.get('timestamp')
+                                            'timestamp': obj.get('timestamp'),
+                                            **_identity(obj)
                                         })
                                 content = [item for item in content
                                            if not (isinstance(item, dict) and item.get('type') == 'tool_result')]
@@ -134,7 +144,8 @@ def extract_claude_project_conversations(project_dir):
                                 msg = {
                                     'role': 'user',
                                     'content': content,
-                                    'timestamp': obj.get('timestamp')
+                                    'timestamp': obj.get('timestamp'),
+                                    **_identity(obj)
                                 }
 
                                 # Extract tool use (code context, diffs, etc.)
@@ -176,8 +187,19 @@ def extract_claude_project_conversations(project_dir):
                                     'role': 'assistant',
                                     'content': full_text,
                                     'model': message.get('model'),
-                                    'timestamp': obj.get('timestamp')
+                                    'timestamp': obj.get('timestamp'),
+                                    **_identity(obj)
                                 }
+
+                                # One response can be written as several entries that repeat the
+                                # same usage; message_id lets a consumer count it once
+                                if message.get('id'):
+                                    msg['message_id'] = message['id']
+                                if obj.get('requestId'):
+                                    msg['request_id'] = obj['requestId']
+                                usage = message.get('usage')
+                                if isinstance(usage, dict):
+                                    msg['usage'] = {k: usage[k] for k in USAGE_KEYS if k in usage}
 
                                 if thinking:
                                     msg['reasoning'] = '\n'.join(thinking)
@@ -197,8 +219,13 @@ def extract_claude_project_conversations(project_dir):
                                     'timestamp': obj.get('timestamp'),
                                     'custom': True,
                                     'custom_type': 'hook_additional_context',
-                                    'hook_event': attachment.get('hookEvent')
+                                    'hook_event': attachment.get('hookEvent'),
+                                    **_identity(obj)
                                 })
+                            else:
+                                # Not conversation, but say what was left out
+                                kind = attachment.get('type') or 'unknown'
+                                omitted_attachments[kind] = omitted_attachments.get(kind, 0) + 1
 
                         elif msg_type == 'tool_result':
                             # Capture tool results (diffs, file reads, etc.)
@@ -219,6 +246,7 @@ def extract_claude_project_conversations(project_dir):
                     'session_id': session_id,
                     'project_path': project_path,
                     'project_name': project_name,
+                    'omitted_attachments': omitted_attachments,
                     'source_file': str(jsonl_file),
                     'installation': str(project_dir)
                 })
