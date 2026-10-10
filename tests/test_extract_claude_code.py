@@ -3124,3 +3124,10 @@ class ExtractClaudeCodeEscapedGrowthTests(unittest.TestCase):
                     largest[path.__name__] = max(largest[path.__name__], path(message) - path(was))
         # The bound was measured on something close to it, on both paths
         self.assertGreater(min(largest["escaped"], largest["utf8"]), 18_000)
+
+    def test_an_id_over_the_limit_is_refused_without_being_written_out(self):
+        # One entry can carry thousands of results that name the same oversized caller id
+        for value in ("x" * (extract_claude_code.ID_LIMIT + 1), "\u00e9" * 1_000_000):
+            with mock.patch.object(extract_claude_code.json, "dumps", side_effect=AssertionError("written out")):
+                self.assertIsNone(extract_claude_code._id(value))
+        self.assertEqual(extract_claude_code._id("x" * extract_claude_code.ID_LIMIT), "x" * extract_claude_code.ID_LIMIT)

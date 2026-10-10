@@ -173,7 +173,9 @@ def _id(value):
 
     An empty id is returned as it is: it is false, like None, so it is never written either.
     """
-    return value if isinstance(value, str) and len(json.dumps(value)) - 2 <= ID_LIMIT and _writable(value) else None
+    # The JSON is never shorter than the text, so text over the limit is refused without writing it out
+    return value if (isinstance(value, str) and len(value) <= ID_LIMIT and len(json.dumps(value)) - 2 <= ID_LIMIT
+                     and _writable(value)) else None
 
 
 def _canonical(value):
