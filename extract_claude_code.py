@@ -147,10 +147,30 @@ def _omitted_blocks(content):
     return blocks
 
 
-STRUCTURED_STRING_LIMIT = 2000   # characters
+STRUCTURED_STRING_LIMIT = 2000   # characters, of a string and of a key
 STRUCTURED_LIST_LIMIT = 100      # items
 STRUCTURED_DEPTH_LIMIT = 32      # containers inside one another
 STRUCTURED_SIZE_LIMIT = 16000    # bytes of JSON, after the limits above
+SUBAGENT_TOTAL_LIMIT = 1000      # bytes of JSON of each total in 'subagent_ref'
+ID_LIMIT = 200                   # characters of an id written outside 'structured'
+OMITTED_KEY = 'omitted-key-'
+
+
+def _writable(text):
+    """Whether a string can be written as UTF-8; half of a surrogate pair cannot"""
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _id(value):
+    """An id as an added field may hold it, UTF-8 text of at most ID_LIMIT characters, else None
+
+    An empty id is returned as it is: it is false, like None, so it is never written either.
+    """
+    return value if isinstance(value, str) and len(value) <= ID_LIMIT and _writable(value) else None
 
 
 def _canonical(value):
@@ -168,21 +188,21 @@ def _left_out(value=None):
     try:
         raw = value.encode('utf-8') if isinstance(value, str) else _canonical(value)
         kind = {str: 'string', list: 'list', dict: 'object'}[type(value)]
-    except (KeyError, RecursionError, TypeError, ValueError):
+    except (KeyError, RecursionError, ValueError):
         return {'omitted': True, 'kind': 'unserialisable'}
     return {'omitted': True, 'kind': kind, 'length': len(value), 'sha256': hashlib.sha256(raw).hexdigest()}
 
 
 def _bounded(value, depth=0, image=False):
-    """A value from a transcript with every long string and long list replaced by _left_out"""
+    """A value from a transcript with every long string and long list replaced by _left_out
+
+    A key over STRUCTURED_STRING_LIMIT characters, or one that is not UTF-8, is replaced by
+    OMITTED_KEY and the SHA-256 (64 hex digits) of its UTF-8 bytes, unpaired surrogates kept.
+    """
     if isinstance(value, str):
         if image or len(value) > STRUCTURED_STRING_LIMIT:
             return _left_out(value)
-        try:
-            value.encode('utf-8')
-        except UnicodeEncodeError:
-            return _left_out()  # half of a surrogate pair cannot be written as UTF-8
-        return value
+        return value if _writable(value) else _left_out()
     if isinstance(value, float) and not math.isfinite(value):
         return _left_out()  # NaN and Infinity are not JSON
     if isinstance(value, (list, dict)):
@@ -194,28 +214,36 @@ def _bounded(value, depth=0, image=False):
             return [_bounded(item, depth + 1) for item in value]
         # Image data is never embedded, however short: the 'base64' of a file that was read,
         # and the 'data' of a base64 source
-        return {key: _bounded(item, depth + 1,
-                              image=key == 'base64' or (key == 'data' and value.get('type') == 'base64'))
-                for key, item in value.items()}
+        bounded = {}
+        for key, item in value.items():
+            name = key
+            if len(key) > STRUCTURED_STRING_LIMIT or not _writable(key):
+                name = OMITTED_KEY + hashlib.sha256(key.encode('utf-8', 'surrogatepass')).hexdigest()
+                if name in value:
+                    raise ValueError('a replaced key is already a key')
+            bounded[name] = _bounded(item, depth + 1,
+                                     image=key == 'base64' or (key == 'data' and value.get('type') == 'base64'))
+        return bounded
     return value
 
 
-def _structured(value):
+def _structured(value, size_limit=STRUCTURED_SIZE_LIMIT):
     """A tool's structured output (toolUseResult), or any value of an entry, in a bounded form
 
     Scalars and small containers are kept as they are. A string over STRUCTURED_STRING_LIMIT
     characters, a list over STRUCTURED_LIST_LIMIT items and image data of any length are
     replaced where they stand by _left_out, as is a value JSON cannot hold (NaN, Infinity,
-    text that is not UTF-8). If what is left is still over STRUCTURED_SIZE_LIMIT bytes, the
-    whole value is replaced. A value nested over STRUCTURED_DEPTH_LIMIT containers deep, or
-    with a key that is not UTF-8, is replaced whole by {'omitted': True, 'kind': 'unserialisable'}.
+    text that is not UTF-8). If what is left is still over `size_limit` bytes, the whole
+    value is replaced. A value nested over STRUCTURED_DEPTH_LIMIT containers deep, or with a
+    replaced key that another key already is, is replaced whole by
+    {'omitted': True, 'kind': 'unserialisable'}.
     """
     try:
         bounded = _bounded(value)
-        size = len(json.dumps(bounded, ensure_ascii=False).encode('utf-8'))
-        return bounded if size <= STRUCTURED_SIZE_LIMIT else _left_out(value)
-    except (AttributeError, RecursionError, TypeError, ValueError):
+    except ValueError:
         return _left_out()
+    size = len(json.dumps(bounded, ensure_ascii=False).encode('utf-8'))
+    return bounded if size <= size_limit else _left_out(value)
 
 
 SUBAGENT_TOTALS = {'totalTokens': 'total_tokens', 'usage': 'usage'}
@@ -226,19 +254,20 @@ def _subagent_ref(result):
 
     'agent' is the id the sub-agent's conversation is exported under ('agent' there, and in the
     session's 'subagent_sessions'), so the totals reported to the parent can be set against the
-    usage of the sub-agent's own messages. They are never added to the parent's usage.
+    usage of the sub-agent's own messages. They are never added to the parent's usage. An
+    agentId that _id refuses gives no reference; a total over SUBAGENT_TOTAL_LIMIT is left out.
     """
-    if not isinstance(result, dict) or not isinstance(result.get('agentId'), str) or not result['agentId']:
-        return None
-    totals = {name: _structured(result[key]) for key, name in SUBAGENT_TOTALS.items() if key in result}
-    return {'agent': _name(result['agentId']), **totals} if totals else None
+    agent = _id(result.get('agentId')) if isinstance(result, dict) else None
+    totals = {name: _structured(result[key], SUBAGENT_TOTAL_LIMIT)
+              for key, name in SUBAGENT_TOTALS.items() if agent and key in result}
+    return {'agent': agent, **totals} if totals else None
 
 
 def _link_calling_entries(unlinked, messages):
     """Give each tool message whose entry did not name its caller the one exported entry that made the call
 
     Nothing is written when no exported assistant message has a tool_use with that id, when
-    more than one has, or when the one that has carries no entry id.
+    more than one has, or when the one that has carries no entry id that _id accepts.
     """
     callers = {}
     for message in messages:
@@ -249,7 +278,7 @@ def _link_calling_entries(unlinked, messages):
                     made_by.append(message['id'])
     for tool_msg in unlinked:
         made_by = callers.get(tool_msg['tool_call_id'], ()) if isinstance(tool_msg['tool_call_id'], str) else ()
-        if len(made_by) == 1 and isinstance(made_by[0], str) and made_by[0]:
+        if len(made_by) == 1 and _id(made_by[0]):
             tool_msg['source_assistant_id'] = made_by[0]
 
 
@@ -415,7 +444,7 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
     omitted_attachments = {}
     omitted_entries = {}
     skipped_lines = 0
-    unlinked = []  # tool messages with a structured result whose entry does not name the calling entry
+    unlinked = []  # tool messages with a structured result whose entry names no calling entry (absent or null)
     session_id = _name(jsonl_file.stem)
     project_path = None
     entry_session_id = None
@@ -454,9 +483,9 @@ def _convert_session_file(jsonl_file, project_dir, project_name):
                                 omitted = _omitted_blocks(item.get('content'))
                                 if omitted:
                                     tool_msg['omitted_content'] = omitted
-                                if isinstance(caller, str) and caller:
+                                if _id(caller):
                                     tool_msg['source_assistant_id'] = caller
-                                elif obj.get('toolUseResult') is not None:
+                                elif caller is None and obj.get('toolUseResult') is not None:
                                     unlinked.append(tool_msg)
                                 if result is not None:
                                     tool_msg['structured'] = _structured(result)

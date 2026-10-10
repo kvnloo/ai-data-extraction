@@ -6,6 +6,7 @@ import random
 import shutil
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -2178,6 +2179,9 @@ class SubagentCopyGroupingTests(unittest.TestCase):
 
 
 ADDED_FIELDS = ("structured", "source_assistant_id", "subagent_ref", "stop_reason")
+ID_LIMIT = 200            # characters of an id in source_assistant_id and subagent_ref.agent
+TOTAL_LIMIT = 1000        # bytes of each total in subagent_ref
+GROWTH_LIMIT = 20_000     # bytes the added fields may add to one message
 UNSERIALISABLE = {"omitted": True, "kind": "unserialisable"}
 STRING_LIMIT = extract_claude_code.STRUCTURED_STRING_LIMIT
 LIST_LIMIT = extract_claude_code.STRUCTURED_LIST_LIMIT
@@ -2203,6 +2207,11 @@ def marker(value):
     kind = {str: "string", list: "list", dict: "object"}[type(value)]
     raw = value.encode() if kind == "string" else json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return {"omitted": True, "kind": kind, "length": len(value), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def key_marker(key):
+    """The key the export writes in place of one it does not embed"""
+    return "omitted-key-" + hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def shell_result(rng):
@@ -2454,7 +2463,7 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
                           "cut": UNSERIALISABLE, "fine": 1.5})
         self.assertEqual(self.structured("x" * STRING_LIMIT + "\udc80"), UNSERIALISABLE)
         self.assertEqual(self.structured(float("nan")), UNSERIALISABLE)
-        self.assertEqual(self.structured({"bad key \ud800": 1, "fine": 2}), UNSERIALISABLE)
+        self.assertEqual(self.structured({"bad key \ud800": 1, "fine": 2}), {key_marker("bad key \ud800"): 1, "fine": 2})
         self.assertEqual(self.structured([float("nan")] * (LIST_LIMIT + 1))["kind"], "list")
 
     def test_a_result_nested_too_deeply_is_said_to_be_left_out(self):
@@ -2473,6 +2482,148 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
         self.assertNotIn("stop_reason", replies[1])
         self.assertNotIn("stop_reason", replies[2])
         self.assertEqual(replies[3]["stop_reason"], UNSERIALISABLE)
+
+    def test_a_stop_reason_that_is_not_null_is_kept_whatever_it_is(self):
+        messages = self.export([user("u1", None, "go"), call(stop_reason=""), call(uuid="s2", stop_reason=0),
+                                call(uuid="s3", stop_reason=False), call(uuid="s4", stop_reason="r" * (STRING_LIMIT + 1)),
+                                call(uuid="s5", stop_reason="a\ud800b")])[0]["messages"]
+
+        self.assertEqual([m["stop_reason"] for m in messages[1:4]], ["", 0, False])
+        self.assertIs(messages[3]["stop_reason"], False)
+        self.assertEqual(messages[4]["stop_reason"], marker("r" * (STRING_LIMIT + 1)))
+        self.assertEqual(messages[5]["stop_reason"], UNSERIALISABLE)
+
+    def test_a_result_of_exactly_the_size_limit_is_kept(self):
+        limit = extract_claude_code.STRUCTURED_SIZE_LIMIT
+        at, over = ["x" * 1996] * 8, ["x" * 1996] * 7 + ["x" * 1997]
+        self.assertEqual((limit, len(json.dumps(at)), len(json.dumps(over))), (16000, 16000, 16001))
+        self.assertEqual(self.structured(at), at)
+        self.assertEqual(self.structured(over), marker(over))
+        # The size is in bytes of the text as it is written, not in characters
+        wide, wider = ["\u00e9" * 998] * 8, ["\u00e9" * 998] * 7 + ["\u00e9" * 998 + "x"]
+        self.assertEqual(len(json.dumps(wide, ensure_ascii=False).encode("utf-8")), limit)
+        self.assertEqual(self.structured(wide), wide)
+        self.assertEqual(self.structured(wider), marker(wider))
+
+    def test_only_the_data_of_a_base64_source_is_image_data(self):
+        source = {"type": "base64", "media_type": "image/png", "note": "thumbnail", "data": "QUJD"}
+        self.assertEqual(self.structured(source), {**source, "data": marker("QUJD")})
+
+    def test_a_key_that_is_long_or_not_text_is_replaced_by_its_hash(self):
+        kept, long, cut = "k" * STRING_LIMIT, "\u00e9" * (STRING_LIMIT + 1), "bad key \ud800"
+        output = "E" * (STRING_LIMIT + 1)
+
+        structured = self.structured({kept: 1, long: {"stdout": output}, cut: [2], "nested": [{long: 3}], "fine": 4})
+
+        self.assertEqual(structured, {kept: 1, key_marker(long): {"stdout": marker(output)}, key_marker(cut): [2],
+                                      "nested": [{key_marker(long): 3}], "fine": 4})
+        # The form: 'omitted-key-' and the SHA-256 of the key's UTF-8 bytes, all 64 hex digits
+        self.assertEqual(key_marker(long), "omitted-key-" + hashlib.sha256(long.encode("utf-8")).hexdigest())
+        self.assertEqual(len(key_marker(long)), 76)
+        # Two keys that are not text are still two keys
+        self.assertEqual(self.structured({cut: 1, "\udcff": 2}), {key_marker(cut): 1, key_marker("\udcff"): 2})
+        big = "k" * 5_000_000
+        self.assertEqual(self.structured({big: 1}), {key_marker(big): 1})
+        # Image data under a replaced key's object is still image data
+        self.assertEqual(self.structured({long: {"base64": "QUJD"}}), {key_marker(long): {"base64": marker("QUJD")}})
+
+    def test_a_replaced_key_never_takes_the_place_of_another_key(self):
+        long, cut = "k" * (STRING_LIMIT + 1), "\udcff"
+        for case, taken in {"after": {long: 1, key_marker(long): 2}, "before": {key_marker(long): 2, long: 1},
+                            "nested": {"a": [{cut: 1, key_marker(cut): 2}]}}.items():
+            with self.subTest(case):
+                self.assertEqual(self.structured(taken), UNSERIALISABLE)
+        # Alone, a key that only looks like a marker is an ordinary key
+        self.assertEqual(self.structured({key_marker(long): 2, "fine": 1}), {key_marker(long): 2, "fine": 1})
+
+    def test_a_value_that_cannot_be_described_costs_only_itself(self):
+        # A string over the limit that holds half a surrogate pair has no UTF-8 bytes to hash
+        cut = "x" * STRING_LIMIT + "\udc80"
+        self.assertEqual(self.structured({"stdout": cut, "fine": 1}), {"stdout": UNSERIALISABLE, "fine": 1})
+        self.assertEqual(self.structured({"type": "base64", "data": "\ud800"}), {"type": "base64", "data": UNSERIALISABLE})
+
+        # A list over the limit, nested too deeply to be written as the JSON that would be hashed
+        levels = depth_that_parses_but_cannot_be_written()
+        if levels is None:
+            self.skipTest("this interpreter refuses to read any nesting it cannot write")
+        matches = "[%s%s]" % (deep(levels), ", 0" * LIST_LIMIT)
+        line = json.dumps(result(toolUseResult="@@")).replace('"@@"', '{"matches": %s, "fine": 1}' % matches)
+        (self.project / "sess-1.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in (user("u1", None, "go"), call())) + line + "\n")
+
+        messages = extract_claude_project_conversations(self.root)[0]["messages"]
+
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[2]["structured"], {"matches": UNSERIALISABLE, "fine": 1})
+
+    def test_an_id_the_export_adds_is_short_text_or_absent(self):
+        self.assertEqual((extract_claude_code.ID_LIMIT, extract_claude_code.SUBAGENT_TOTAL_LIMIT), (ID_LIMIT, TOTAL_LIMIT))
+        found = {"stdout": "ok"}
+        longest = "\u00e9" * ID_LIMIT
+        tool, = self.tools(call(), result(sourceToolAssistantUUID=longest))
+        self.assertEqual(tool["source_assistant_id"], longest)
+
+        not_ids = {"over the limit": "s" * (ID_LIMIT + 1), "5 MB": "s" * 5_000_000, "half a pair": "a\ud800b",
+                   "not UTF-8": "\udcff", "a number": 7, "a list": ["s1"], "an object": {"id": "s1"}, "empty": ""}
+        for case, named in not_ids.items():
+            # With a structured result too: the entry named its caller, so no other is looked for
+            for extra in ({}, {"toolUseResult": found}):
+                with self.subTest(case, **extra):
+                    tool, = self.tools(call(), result(sourceToolAssistantUUID=named, **extra))
+                    self.assertNotIn("source_assistant_id", tool)
+        # null names no one, like a missing field
+        tool, = self.tools(call(), result(sourceToolAssistantUUID=None, toolUseResult=found))
+        self.assertEqual(tool["source_assistant_id"], "s1")
+
+        # The entry found by its tool_use is written under the same limit
+        tool, = self.tools(call(uuid="s" * ID_LIMIT), result(toolUseResult=found))
+        self.assertEqual(tool["source_assistant_id"], "s" * ID_LIMIT)
+        tool, = self.tools(call(uuid="s" * (ID_LIMIT + 1)), result(toolUseResult=found))
+        self.assertNotIn("source_assistant_id", tool)
+
+    def test_a_launch_reference_names_an_agent_only_by_a_short_text_id(self):
+        tool, = self.tools(call(), result(toolUseResult={"agentId": "\u00e9" * ID_LIMIT, "totalTokens": 5}))
+        self.assertEqual(tool["subagent_ref"], {"agent": "\u00e9" * ID_LIMIT, "total_tokens": 5})
+
+        over, big = "g" * (ID_LIMIT + 1), "g" * 5_000_000
+        cases = {"over the limit": (over, over), "5 MB": (big, marker(big)), "half a pair": ("a\ud800b", UNSERIALISABLE),
+                 "not UTF-8": ("\udcff", UNSERIALISABLE), "a number": (7, 7), "a list": (["g"], ["g"]),
+                 "an object": ({"id": "g"}, {"id": "g"}), "null": (None, None), "empty": ("", "")}
+        for case, (agent_id, kept) in cases.items():
+            with self.subTest(case):
+                tool, = self.tools(call(), result(toolUseResult={"agentId": agent_id, "totalTokens": 5}))
+                # No reference at all, and the id is still described under 'structured'
+                self.assertNotIn("subagent_ref", tool)
+                self.assertEqual(tool["structured"], {"agentId": kept, "totalTokens": 5})
+
+    def test_the_totals_of_a_launch_reference_are_small_or_described(self):
+        ref = lambda **totals: self.tools(call(), result(toolUseResult={"agentId": "g", **totals}))[0]["subagent_ref"]
+        fits, large = {"note": "n" * (TOTAL_LIMIT - 12)}, {"note": "n" * (TOTAL_LIMIT - 11)}
+        self.assertEqual((len(json.dumps(fits)), len(json.dumps(large))), (TOTAL_LIMIT, TOTAL_LIMIT + 1))
+
+        self.assertEqual(ref(usage=fits, totalTokens=fits), {"agent": "g", "total_tokens": fits, "usage": fits})
+        self.assertEqual(ref(usage=large, totalTokens=large),
+                         {"agent": "g", "total_tokens": marker(large), "usage": marker(large)})
+
+    def test_the_added_fields_of_one_message_stay_under_20_kb_at_their_largest(self):
+        wide = "\U0001f600"  # four bytes of UTF-8 to the character
+        launch = {"agentId": wide * ID_LIMIT, "usage": {"note": "n" * (TOTAL_LIMIT - 12)},
+                  "totalTokens": "t" * (TOTAL_LIMIT - 2), "pad": []}
+        size = lambda value: len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        while size(launch) + STRING_LIMIT + 4 <= extract_claude_code.STRUCTURED_SIZE_LIMIT:
+            launch["pad"].append("p" * STRING_LIMIT)
+        launch["pad"].append("p" * (extract_claude_code.STRUCTURED_SIZE_LIMIT - size(launch) - 4))
+        self.assertEqual(size(launch), extract_claude_code.STRUCTURED_SIZE_LIMIT)
+
+        bare, = self.tools(call(), result())
+        tool, = self.tools(call(), result(toolUseResult=launch, sourceToolAssistantUUID=wide * ID_LIMIT))
+
+        self.assertEqual(tool["structured"], launch)
+        self.assertEqual(tool["subagent_ref"], {"agent": wide * ID_LIMIT, "total_tokens": launch["totalTokens"],
+                                                "usage": launch["usage"]})
+        self.assertEqual(tool["source_assistant_id"], wide * ID_LIMIT)
+        self.assertLess(size(tool) - size(bare), GROWTH_LIMIT)
+        self.assertGreater(size(tool) - size(bare), GROWTH_LIMIT - 1000)
 
     def test_a_sub_agent_launch_can_be_reconciled_with_the_sub_agent_conversation(self):
         sub_usage = {"input_tokens": 100, "output_tokens": 40, "cache_creation_input_tokens": 0,
@@ -2516,8 +2667,10 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
         self.assertEqual("absent", ref({"agentId": 7, "totalTokens": 5}))
         self.assertEqual("absent", ref({"agentId": "", "totalTokens": 5}))
         self.assertEqual("absent", ref("agentId totalTokens"))
-        # An id that is not text is written the way the sub-agent's file name is
-        self.assertEqual(ref({"agentId": "\udcff", "totalTokens": 5})["agent"], "bytes://%FF")
+        # A total of nothing is still a total that was stated
+        self.assertEqual(ref({"agentId": "g", "totalTokens": 0}), {"agent": "g", "total_tokens": 0})
+        self.assertEqual(ref({"agentId": "g", "usage": {}}), {"agent": "g", "usage": {}})
+        self.assertEqual(ref({"agentId": "g", "totalTokens": 0, "usage": {}}), {"agent": "g", "total_tokens": 0, "usage": {}})
 
     def test_the_added_fields_are_the_only_difference_they_make(self):
         for seed in range(200):
@@ -2550,3 +2703,102 @@ class ExtractClaudeCodeToolResultTests(unittest.TestCase):
         self.assertEqual(with_fields[0], without_fields[0])  # the prompt has none of the new fields
         self.assertNotEqual(with_fields[1], without_fields[1])
         self.assertNotEqual(with_fields[2], without_fields[2])
+
+
+HOSTILE_FIELDS = ("toolUseResult", "sourceToolAssistantUUID", "stop_reason", "agentId", "totalTokens", "usage", "a key")
+HOSTILE_KINDS = ("a lone surrogate", "5 MB of text", "a number", "a list", "an object", "null", "an empty string",
+                 "not UTF-8 once unescaped")
+HOSTILE_ROUNDS = 6
+
+
+def hostile_value(kind, seed, largest):
+    """A value of `kind` no entry should carry in a field; `largest` gives the 5 MB text, else a shorter long text"""
+    rng = random.Random(seed)
+    return {
+        "a lone surrogate": "a\ud800b",
+        "5 MB of text": "t" * (5_000_000 if largest else rng.choice([ID_LIMIT + 1, STRING_LIMIT + 1, 16001, 100_000])),
+        "a number": rng.choice([0, 7, -1.5, 10 ** 30]),
+        "a list": [f"item {n} " * 20 for n in range(rng.choice([0, 3, LIST_LIMIT, LIST_LIMIT + 1]))],
+        "an object": {f"k{n}": "v" * 900 for n in range(rng.choice([0, 2, 15, 30]))},
+        "null": None,
+        "an empty string": "",
+        "not UTF-8 once unescaped": rng.choice(["\udcff", "\udc80\udcfe tail", "\ud83d"]),
+    }[kind]
+
+
+def hostile_session(seed, field, value):
+    """generated_session(seed, True) with `value` in `field` of its entries (of the first only, when it is large)"""
+    rows = generated_session(seed, True)
+    pairs = list(zip(rows[1::2], rows[2::2]))
+    for made, back in pairs[:1] if isinstance(value, str) and len(value) > 1_000_000 else pairs:
+        if field == "stop_reason":
+            made["message"][field] = value
+        elif field in ("toolUseResult", "sourceToolAssistantUUID"):
+            back[field] = value
+        elif field == "a key":
+            key = value if isinstance(value, str) else json.dumps(value)
+            back["toolUseResult"] = {"stdout": "ok", key: "value", "nested": [{key: {"base64": "QUJD"}}]}
+        else:
+            back["toolUseResult"] = {"status": "completed", "agentId": "g", "totalTokens": 9,
+                                     "usage": {"output_tokens": 9}, field: value}
+    return rows
+
+
+def hostile_sessions():
+    """(number, field, kind, rows with the value, the same rows without any new field), 336 of them"""
+    combinations = list(itertools.product(HOSTILE_FIELDS, HOSTILE_KINDS))
+    for number in range(HOSTILE_ROUNDS * len(combinations)):
+        field, kind = combinations[number % len(combinations)]
+        value = hostile_value(kind, number, largest=number < len(combinations))
+        yield number, field, kind, hostile_session(number, field, value), generated_session(number, False)
+
+
+class ExtractClaudeCodeHostileFieldTests(unittest.TestCase):
+    """main() over sessions whose new fields carry what they should not: the export still completes"""
+
+    run_main = ExtractClaudeCodeWholeExportTests.run_main
+    written = ExtractClaudeCodeWholeExportTests.written
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name) / "home"
+        self.projects = self.home / ".claude" / "projects"
+        self.out = Path(tmp.name) / "out"
+        self.out.mkdir()
+
+    def test_no_value_in_a_new_field_stops_the_export_or_adds_more_than_20_kb_to_a_message(self):
+        expected = {}
+        for number, field, kind, rich, bare in hostile_sessions():
+            for project, rows in (("-rich", rich), ("-bare", bare)):
+                write_rows(self.projects / project / f"s{number}.jsonl", rows)
+                if number % 7 == 3:  # some as a sub-agent transcript too, which is written by another path
+                    write_rows(self.projects / project / f"s{number}" / "subagents" / f"agent-a{number}.jsonl", rows)
+            expected[f"s{number}"] = (field, kind)
+        self.assertGreaterEqual(len(expected), 300)
+        self.assertEqual({pair for pair in expected.values()}, set(itertools.product(HOSTILE_FIELDS, HOSTILE_KINDS)))
+
+        self.run_main(encoding="utf-8")  # main() returns: the process would exit 0
+
+        output, = (self.out / "extracted_data").glob("claude_code_conversations_*.jsonl")
+        data = output.read_bytes()
+        self.assertTrue(data.endswith(b"\n"))
+        conversations = [json.loads(line) for line in data.decode("utf-8").split("\n")[:-1]]
+        by_file = {c["source_file"]: c for c in conversations}
+        rich = [c for c in conversations if "/-rich/" in c["source_file"]]
+        sub_agents = sum(1 for number in range(len(expected)) if number % 7 == 3)
+        self.assertEqual(len(rich), len(expected) + sub_agents)
+        self.assertEqual(len(conversations), 2 * len(rich))
+
+        size = lambda value: len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        added = Counter()
+        for after in rich:
+            before = by_file[after["source_file"].replace("/-rich/", "/-bare/")]
+            with self.subTest(file=after["source_file"]):
+                self.assertEqual(without_added([after], also=["dedupe_key"])[0]["messages"],
+                                 without_added([before], also=["dedupe_key"])[0]["messages"])
+                for message, was in zip(after["messages"], before["messages"]):
+                    added.update(key for key in ADDED_FIELDS if key in message)
+                    self.assertLessEqual(size(message) - size(was), GROWTH_LIMIT)
+        # Every added field was written somewhere, so the limits above were measured on something
+        self.assertEqual(set(added), set(ADDED_FIELDS))
