@@ -97,6 +97,55 @@ for tool in pi omp droid; do
     echo ""
 done
 
+# Hermes reads the default database and all profile databases without modifying them.
+echo "🔍 Extracting from Hermes..."
+if (set -o pipefail; python3 extract_hermes.py 2>&1 | tee extracted_data/hermes_extraction.log); then
+    if grep -q "Total conversations: [1-9]" extracted_data/hermes_extraction.log; then
+        found_tools+=("Hermes")
+    else
+        not_found+=("Hermes")
+    fi
+else
+    echo "❌ Hermes extraction failed; see extracted_data/hermes_extraction.log" >&2
+    exit 1
+fi
+echo ""
+
+# Snapshot the input list before creating the combined file. Previous combined
+# outputs must not be folded into the corpus again on subsequent runs.
+shopt -s nullglob
+conversation_files=()
+for conversation_file in extracted_data/*.jsonl; do
+    case "${conversation_file##*/}" in
+        ALL_CONVERSATIONS_*) continue ;;
+    esac
+    conversation_files+=("$conversation_file")
+done
+combined_file="extracted_data/ALL_CONVERSATIONS_$(date +%Y%m%d_%H%M%S).jsonl"
+if ! python3 combine_conversations.py --output "$combined_file" "${conversation_files[@]}"; then
+    echo "❌ Conversation aggregation failed." >&2
+    exit 1
+fi
+
+# Repository paths are explicit arguments; no repositories are auto-discovered.
+# Git side tables live in a subdirectory and are not conversation records.
+if [ "$#" -gt 0 ]; then
+    echo "🔍 Extracting from Git..."
+    if (set -o pipefail; python3 extract_git.py "$@" --sessions "$combined_file" 2>&1 | tee extracted_data/git_extraction.log); then
+        if grep -q "Total commits: [1-9]" extracted_data/git_extraction.log; then
+            found_tools+=("Git")
+        else
+            not_found+=("Git")
+        fi
+    else
+        echo "❌ Git extraction failed; see extracted_data/git_extraction.log" >&2
+        exit 1
+    fi
+else
+    echo "Git extraction skipped: pass repository paths to extract_all.sh."
+fi
+echo ""
+
 echo "================================================================================"
 echo "EXTRACTION SUMMARY"
 echo "================================================================================"
@@ -119,19 +168,17 @@ if [ ${#not_found[@]} -gt 0 ]; then
 fi
 
 # Count total conversations
-total_lines=$(cat extracted_data/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+total_lines=$(wc -l < "$combined_file" | tr -d ' ')
 
 echo "📊 Total conversations extracted: $total_lines"
 echo ""
 
 # Show file sizes
 echo "📁 Output files:"
-ls -lh extracted_data/*.jsonl 2>/dev/null | awk '{print "   " $9 " (" $5 ")"}'
+if [ ${#conversation_files[@]} -gt 0 ]; then
+    ls -lh "${conversation_files[@]}" | awk '{print "   " $9 " (" $5 ")"}'
+fi
 echo ""
-
-# Create combined file
-combined_file="extracted_data/ALL_CONVERSATIONS_$(date +%Y%m%d_%H%M%S).jsonl"
-cat extracted_data/*.jsonl 2>/dev/null | grep -v "extraction.log" > "$combined_file"
 
 if [ -f "$combined_file" ]; then
     combined_size=$(ls -lh "$combined_file" | awk '{print $5}')

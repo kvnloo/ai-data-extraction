@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import random
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,9 @@ from typing import Any, Iterable
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+CORPUS_TIERS = ("private", "public")
+PROVIDERS = ("local", "anthropic", "openai-compatible")
+CLAUDE_MODEL_PATTERN = re.compile(r"^claude-[a-z0-9][a-z0-9.-]*$")
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,89 @@ def chat_completions_url(base_url: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
+def validate_model_route(
+    *,
+    base_url: str,
+    model: str,
+    provider: str = "openai-compatible",
+    corpus_tier: str = "private",
+) -> None:
+    """Enforce PRIV2 before reading corpus data or opening a model connection.
+
+    Provider and public-tier declarations are trusted operator classifications.
+    A loopback URL alone is not local-inference evidence: it may be a cloud relay.
+    Filtering private text does not make it public.
+    """
+    if corpus_tier not in CORPUS_TIERS:
+        raise ValueError("PRIV2: unknown corpus tier; use private or public")
+    if provider not in PROVIDERS:
+        raise ValueError("PRIV2: unknown model provider")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("PRIV2: a model ID is required")
+    if not isinstance(base_url, str) or any(
+        character.isspace() or ord(character) < 32 for character in base_url
+    ):
+        raise ValueError("PRIV2: invalid model endpoint")
+    try:
+        endpoint = urllib.parse.urlsplit(base_url)
+        hostname = endpoint.hostname
+        port = endpoint.port
+    except ValueError as exc:
+        raise ValueError("PRIV2: invalid model endpoint") from exc
+    if (
+        endpoint.scheme not in ("http", "https")
+        or not hostname
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.query
+        or endpoint.fragment
+    ):
+        raise ValueError(
+            "PRIV2: use an HTTP(S) model endpoint without credentials, query or fragment"
+        )
+    try:
+        loopback = "%" not in hostname and ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        loopback = False
+
+    if provider == "local":
+        if not loopback:
+            raise ValueError(
+                "PRIV2: local inference requires a numeric loopback endpoint "
+                "(127.0.0.1 or ::1)"
+            )
+        return
+
+    if provider == "anthropic":
+        if (
+            endpoint.scheme != "https"
+            or hostname != "api.anthropic.com"
+            or port not in (None, 443)
+            or endpoint.path.rstrip("/") not in ("", "/v1")
+            or not CLAUDE_MODEL_PATTERN.fullmatch(model)
+        ):
+            raise ValueError(
+                "PRIV2: Anthropic requires a Claude model at "
+                "https://api.anthropic.com/v1"
+            )
+        return
+
+    if corpus_tier != "public":
+        raise ValueError(
+            "PRIV2: private corpus may only use explicitly declared local inference "
+            "or the direct Anthropic Claude endpoint; filtering does not make it public"
+        )
+    if endpoint.scheme != "https" and not loopback:
+        raise ValueError("PRIV2: remote public-corpus endpoints require HTTPS")
+
+
+class _NoModelRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            request.full_url, code, "Model endpoint redirects are disabled", headers, fp
+        )
+
+
 def build_prompt(corpus: str, skill_count: int) -> list[dict[str, str]]:
     system = f"""You create concise, reusable Agent Skills from conversation evidence.
 Return one JSON object with a single \"skills\" array containing exactly {skill_count} skills.
@@ -173,14 +261,17 @@ def call_model(
     model: str,
     messages: list[dict[str, str]],
     timeout: float,
+    provider: str = "openai-compatible",
+    corpus_tier: str = "private",
 ) -> str:
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-        }
-    ).encode("utf-8")
+    validate_model_route(
+        base_url=base_url, model=model, provider=provider, corpus_tier=corpus_tier
+    )
+    payload_data: dict[str, Any] = {"model": model, "messages": messages}
+    # Claude's compatibility endpoint applies model-specific sampling defaults.
+    if provider != "anthropic":
+        payload_data["temperature"] = 0.2
+    payload = json.dumps(payload_data).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -190,12 +281,16 @@ def call_model(
         headers=headers,
         method="POST",
     )
+    # Neither environment proxies nor redirects may change the validated route.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoModelRedirects()
+    )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             response_payload = json.load(response)
     except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Model endpoint returned HTTP {exc.code}: {details}") from exc
+        # An error body may echo private input; do not copy it into logs.
+        raise RuntimeError(f"Model endpoint returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach model endpoint: {exc.reason}") from exc
 
@@ -333,6 +428,25 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"OpenAI-compatible API base URL (default: {DEFAULT_BASE_URL})",
     )
     parser.add_argument(
+        "--provider",
+        choices=PROVIDERS,
+        default="openai-compatible",
+        help=(
+            "Model route (default: openai-compatible). local attests that a numeric "
+            "loopback endpoint runs inference locally, without a cloud relay."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-tier",
+        choices=CORPUS_TIERS,
+        default="private",
+        help=(
+            "Data classification (default: private). public explicitly attests that "
+            "all input is approved public metadata, code or benchmark data; "
+            "filtered owner text remains private."
+        ),
+    )
+    parser.add_argument(
         "--api-key-env",
         default="OPENAI_API_KEY",
         help="Environment variable containing the API key (default: OPENAI_API_KEY)",
@@ -371,6 +485,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.timeout <= 0:
             raise ValueError("--timeout must be positive")
 
+        validate_model_route(
+            base_url=args.base_url,
+            model=args.model,
+            provider=args.provider,
+            corpus_tier=args.corpus_tier,
+        )
         files = discover_jsonl(args.inputs)
         corpus, sampled, total = sample_corpus(
             files,
@@ -385,6 +505,8 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             messages=build_prompt(corpus, args.skills),
             timeout=args.timeout,
+            provider=args.provider,
+            corpus_tier=args.corpus_tier,
         )
         skills = validate_skills(
             parse_json_response(content), expected_count=args.skills
@@ -402,3 +524,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
