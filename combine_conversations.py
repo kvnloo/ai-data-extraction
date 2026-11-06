@@ -8,9 +8,10 @@ from pathlib import Path
 import re
 import sys
 
+from conversation_ids import conversation_identifiers
+
 
 SNAPSHOT_TIME = re.compile(r'_(\d{8}_\d{6})(?:_(\d{6}))?\.jsonl$')
-SESSION_IDS = ('session_id', 'composer_id', 'conversation_id', 'chat_id', 'tab_id')
 
 
 def _value(record, *keys):
@@ -28,12 +29,8 @@ def conversation_identity(record):
     source = record.get('source')
     if not isinstance(source, str) or not source:
         return None
-    for field in SESSION_IDS:
-        identifier = record.get(field)
-        if (isinstance(identifier, (str, int)) and not isinstance(identifier, bool)
-                and identifier != ''):
-            break
-    else:
+    identifiers = conversation_identifiers(record)
+    if identifiers is None:
         return None
     source_file = _value(record, 'source_file', 'session_file')
     # File provenance is stronger than mutable project/cwd metadata. Where it
@@ -42,7 +39,7 @@ def conversation_identity(record):
         _value(record, 'installation'), _value(record, 'workspace_id'),
     ]
     return json.dumps([
-        source, field, identifier, _value(record, 'profile'), source_file,
+        source, identifiers, _value(record, 'profile'), source_file,
         namespace,
     ], sort_keys=True, ensure_ascii=True)
 

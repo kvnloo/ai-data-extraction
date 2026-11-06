@@ -1,10 +1,13 @@
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -162,6 +165,188 @@ class ExtractGitTests(unittest.TestCase):
         self.assertEqual({row['profile'] for row in links}, {'default', 'work'})
         self.assertEqual({row['branch_id'] for row in links}, {None, 'leaf'})
         self.assertTrue(all(row['path_field'] == 'git_repo_root' for row in links))
+
+
+    def test_raw_cursor_cli_exports_link_each_agent_without_session_ids(self):
+        self.git(self.repo, 'remote', 'add', 'origin',
+                 'https://github.com/example/repo.git')
+        sha = self.commit(subject='Fix #410')
+        databases = []
+        for agent_id in ('agent-a', 'agent-b'):
+            database = self.home / '.cursor' / 'chats' / 'shared-chat' / agent_id / 'store.db'
+            database.parent.mkdir(parents=True)
+            messages = [
+                {'role': 'user', 'content': 'Fix example/repo#410.',
+                 'timestamp': '2026-01-01T10:00:00Z'},
+                {'role': 'assistant', 'content': f'Completed by {agent_id}.',
+                 'timestamp': '2026-01-01T10:02:00Z'},
+            ]
+            blobs = []
+            for message in messages:
+                data = json.dumps(message).encode('utf-8')
+                blobs.append((hashlib.sha256(data).hexdigest(), data))
+            root_data = b''.join(
+                b'\x0a\x20' + bytes.fromhex(blob_id) for blob_id, _ in blobs)
+            root_id = hashlib.sha256(root_data).hexdigest()
+            metadata = {
+                'agentId': agent_id, 'latestRootBlobId': root_id,
+                'createdAt': 1767261600000,
+            }
+            connection = sqlite3.connect(database)
+            try:
+                with connection:
+                    connection.executescript('''
+                        CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+                        CREATE TABLE meta (value TEXT);
+                    ''')
+                    connection.executemany(
+                        'INSERT INTO blobs VALUES (?, ?)',
+                        blobs + [(root_id, root_data)])
+                    connection.execute(
+                        'INSERT INTO meta VALUES (?)',
+                        (json.dumps(metadata).encode('utf-8').hex(),))
+            finally:
+                connection.close()
+            databases.append(database)
+
+        before = {path: path.read_bytes() for path in databases}
+        scripts = Path(__file__).resolve().parents[1]
+        extraction = subprocess.run(
+            [sys.executable, str(scripts / 'extract_cursor_cli.py')],
+            cwd=self.root, capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(extraction.returncode, 0, extraction.stdout + extraction.stderr)
+        exported = next((self.root / 'extracted_data').glob('cursor_cli_*.jsonl'))
+        raw_text = exported.read_text(encoding='utf-8')
+        conversations = [json.loads(line) for line in raw_text.splitlines()]
+        self.assertEqual(len(conversations), 2)
+        self.assertTrue(all('session_id' not in row for row in conversations))
+        self.assertEqual(
+            {(row['chat_id'], row['agent_id']) for row in conversations},
+            {('shared-chat', 'agent-a'), ('shared-chat', 'agent-b')})
+
+        repeated = self.root / 'same-conversations.jsonl'
+        repeated.write_text(raw_text, encoding='utf-8')
+        output = self.root / 'cursor-git-output'
+        linking = subprocess.run(
+            [sys.executable, str(scripts / 'extract_git.py'), str(self.repo),
+             '--sessions', str(exported), '--sessions', str(repeated),
+             '--output-dir', str(output)],
+            cwd=self.root, capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(linking.returncode, 0, linking.stdout + linking.stderr)
+        links = [json.loads(line) for line in
+                 next(output.glob('git_session_links_*.jsonl')).read_text(
+                     encoding='utf-8').splitlines()]
+        self.assertEqual(len(links), 2)
+        self.assertEqual(len({row['session_id'] for row in links}), 2)
+        self.assertEqual(
+            {row['session_identifiers']['agent_id'] for row in links},
+            {'agent-a', 'agent-b'})
+        for link in links:
+            self.assertEqual(json.loads(link['session_id']), link['session_identifiers'])
+            self.assertEqual(link['session_identifiers']['chat_id'], 'shared-chat')
+            self.assertEqual(link['commit_sha'], sha)
+            self.assertEqual(link['source'], 'cursor-agent-cli')
+            self.assertEqual(link['session_start'], '2026-01-01T10:00:00Z')
+            self.assertEqual(link['session_end'], '2026-01-01T10:02:00Z')
+            self.assertEqual(link['match_basis'],
+                             'repository_issue_reference_and_time_window')
+            self.assertEqual(link['evidence'], [
+                {'kind': 'commit_issue_reference', 'reference': 'example/repo#410'}])
+            self.assertIsNone(link['matched_path'])
+        self.assertEqual(exported.read_text(encoding='utf-8'), raw_text)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+
+    def test_identifier_aliases_keep_types_and_workspace_provenance(self):
+        sha = self.commit()
+        commits = extract_git.extract_repositories([self.repo])
+        base = self.session()
+        del base['session_id']
+        cases = [
+            ('cursor-global-composer', {'composer_id': 'shared'}, None, None),
+            ('cursor-workspace-composer', {'composer_id': 'shared'}, 'workspace-a', None),
+            ('cursor-workspace-composer', {'composer_id': 'shared'}, 'workspace-b', None),
+            ('cursor-workspace-composer', {'composer_id': 'shared'}, 'workspace-a', 'install-b'),
+            ('windsurf', {'conversation_id': 'shared'}, None, None),
+            ('windsurf', {'conversation_id': 0}, None, None),
+            ('windsurf', {'conversation_id': '0'}, None, None),
+            ('cursor-chat', {'tab_id': 'shared'}, 'workspace-a', None),
+            ('cursor-chat', {'chat_id': 'shared'}, 'workspace-a', None),
+            ('cursor-agent-cli', {'chat_id': 'shared:a', 'agent_id': 'b'}, None, None),
+            ('cursor-agent-cli', {'chat_id': 'shared', 'agent_id': 'a:b'}, None, None),
+            ('hermes', {'session_id': 0}, None, None),
+            ('hermes', {'session_id': '0'}, None, None),
+        ]
+        sessions = [
+            {**base, 'source': source, **identifiers,
+             'metadata': {'workspace_id': workspace, 'installation': installation}}
+            for source, identifiers, workspace, installation in cases
+        ]
+        links = extract_git.link_sessions(commits, sessions + sessions)
+        self.assertEqual(len(links), len(cases))
+        self.assertCountEqual(
+            [(row['source'], row['session_identifiers'],
+              row['workspace_id'], row['installation']) for row in links], cases)
+        for link in links:
+            self.assertEqual(link['commit_sha'], sha)
+            self.assertEqual(link['match_basis'], 'repository_path_and_time_window')
+            identifiers = link['session_identifiers']
+            if 'session_id' in identifiers:
+                self.assertIs(type(link['session_id']), type(identifiers['session_id']))
+                self.assertEqual(link['session_id'], identifiers['session_id'])
+            else:
+                self.assertEqual(json.loads(link['session_id']), identifiers)
+
+        # A native session ID that resembles encoded alias text is still distinct.
+        alias_id = next(row['session_id'] for row in links
+                        if row['source'] == 'cursor-global-composer')
+        native = {**base, 'source': 'cursor-global-composer', 'session_id': alias_id,
+                  'composer_id': 'ignored-secondary-id'}
+        collision_links = extract_git.link_sessions(commits, [sessions[0], native])
+        self.assertEqual(len(collision_links), 2)
+        self.assertCountEqual(
+            [row['session_identifiers'] for row in collision_links],
+            [{'composer_id': 'shared'}, {'session_id': alias_id}])
+
+    def test_cursor_aliases_keep_identity_and_evidence_fail_closed(self):
+        self.git(self.repo, 'remote', 'add', 'origin',
+                 'https://github.com/example/repo.git')
+        self.commit(subject='Fix #410')
+        commits = extract_git.extract_repositories([self.repo])
+        base = self.ask_session('Fix example/repo#410.', source='cursor-agent-cli')
+        del base['session_id']
+        valid = {**base, 'chat_id': 'shared', 'agent_id': 'agent'}
+        self.assertEqual(len(extract_git.link_sessions(commits, [valid])), 1)
+        invalid = [
+            {**base, 'chat_id': 'shared'},
+            {**base, 'agent_id': 'agent'},
+            *[{**valid, 'agent_id': value} for value in (None, '', True, [], {}, 1.5)],
+            *[{**valid, 'chat_id': value} for value in (None, '', False, [], {}, 1.5)],
+            {**valid, 'cwd': 'relative-path'},
+            {**valid, 'timestamp': None, 'messages': []},
+            {**valid, 'ended_at': '2026-01-01T10:00:30Z'},
+            {**valid, 'metadata': {'git_repository': 'other/repo'}},
+            {**valid, 'messages': [
+                {'role': 'user', 'content': 'Fix example/repo#410.',
+                 'synthetic': True, 'timestamp': '2026-01-01T10:02:00Z'}]},
+        ]
+        for index, session in enumerate(invalid):
+            with self.subTest(index=index):
+                self.assertEqual(extract_git.link_sessions(commits, [session]), [])
+
+        composer = {**base, 'source': 'cursor-global-composer', 'composer_id': 'composer'}
+        self.assertEqual(len(extract_git.link_sessions(commits, [composer])), 1)
+        for identifier in (None, '', True, [], {}, 1.5):
+            with self.subTest(composer_id=identifier):
+                self.assertEqual(extract_git.link_sessions(
+                    commits, [{**composer, 'composer_id': identifier}]), [])
+        # Cursor GUI formats without a recorded end stay unlinked; identity
+        # normalization cannot manufacture timestamps or use updated_at as an end.
+        self.assertEqual(extract_git.link_sessions(commits, [{
+            **composer, 'created_at': '2026-01-01T10:00:00Z',
+            'updated_at': '2026-01-01T10:02:00Z', 'timestamp': None,
+            'messages': [{'role': 'user', 'content': 'Fix example/repo#410.'}],
+        }]), [])
 
     def test_epoch_offsets_and_message_bounds_match_inclusively(self):
         self.commit()
@@ -749,4 +934,3 @@ class ExtractGitTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

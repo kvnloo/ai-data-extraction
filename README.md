@@ -192,7 +192,16 @@ never treated as interchangeable issue namespaces. If several selected worktrees
 share the repository identity, path-free linking stays unassigned.
 
 Matching records retain source/profile/session identity and the matching
-evidence. They are candidate associations, not proof of authorship.
+evidence. Native `session_id` values keep their original type and value. Existing
+`composer_id`, `conversation_id`, `chat_id`, and `tab_id` exports are also supported;
+Cursor CLI requires the composite `chat_id` / `agent_id` identity. For these
+fallbacks, the link's `session_id` is a JSON-encoded identifier object, and
+`session_identifiers` retains the original named, typed IDs for joining back to
+the conversation. Source/profile/branch/file provenance and, when no source file
+is available, installation/workspace identity distinguish otherwise equal IDs.
+Missing or malformed IDs remain unlinked. Normalization does not add time bounds:
+GUI exports without a recorded end or timestamped messages remain unlinked.
+Links are candidate associations, not proof of authorship.
 Overlapping sessions can still produce several candidates.
 
 ```bash
@@ -218,6 +227,9 @@ from recombination and keeps Git tables outside the conversation corpus.
 
 `combine_conversations.py` selects the newest snapshot for each
 source/profile/session identity, keeping source databases/files distinct.
+Cursor CLI agents sharing a chat remain separate, using both `chat_id` and
+`agent_id`; a newer agent snapshot replaces only that agent's prior snapshot.
+Rows with incomplete Cursor agent identity are retained individually.
 All branch leaves present in that session's newest snapshot survive; older leaf
 IDs are replaced as the session grows. Export timestamps in filenames determine
 recency; unrecognized names fall back to filesystem modification times. A session

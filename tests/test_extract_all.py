@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -168,6 +169,89 @@ class ExtractAllTests(unittest.TestCase):
         self.assertGreater(stats.changed_strings, 0)
         self.assertNotIn('Fixture', filtered.read_text(encoding='utf-8'))
 
+
+    def test_cursor_agent_stores_survive_aggregation_and_snapshot_refresh(self):
+        cursor_root = Path(self.environment['HOME']) / '.cursor' / 'chats'
+
+        def write_store(agent_id, reply):
+            database = cursor_root / 'shared-chat' / agent_id / 'store.db'
+            database.parent.mkdir(parents=True, exist_ok=True)
+            messages = [
+                {'role': 'user', 'content': 'Update the fixture.'},
+                {'role': 'assistant', 'content': reply},
+            ]
+            blobs = []
+            for message in messages:
+                data = json.dumps(message).encode('utf-8')
+                blobs.append((hashlib.sha256(data).hexdigest(), data))
+            root_data = b''.join(
+                b'\x0a\x20' + bytes.fromhex(blob_id) for blob_id, _ in blobs
+            )
+            root_id = hashlib.sha256(root_data).hexdigest()
+            metadata = {
+                'agentId': agent_id,
+                'latestRootBlobId': root_id,
+                'createdAt': 1767225600000,
+                'name': 'Fixture conversation',
+                'mode': 'agent',
+            }
+            connection = sqlite3.connect(database)
+            try:
+                with connection:
+                    connection.executescript('''
+                        CREATE TABLE IF NOT EXISTS blobs
+                            (id TEXT PRIMARY KEY, data BLOB);
+                        CREATE TABLE IF NOT EXISTS meta (value TEXT);
+                        DELETE FROM blobs;
+                        DELETE FROM meta;
+                    ''')
+                    connection.executemany(
+                        'INSERT INTO blobs VALUES (?, ?)',
+                        blobs + [(root_id, root_data)],
+                    )
+                    connection.execute(
+                        'INSERT INTO meta VALUES (?)',
+                        (json.dumps(metadata).encode('utf-8').hex(),),
+                    )
+            finally:
+                connection.close()
+            return database
+
+        agent_a = write_store('agent-a', 'first reply from A')
+        agent_b = write_store('agent-b', 'reply from B')
+        output = self.scripts / 'extracted_data'
+
+        for reply_a in ('first reply from A', 'updated reply from A'):
+            with self.subTest(reply_a=reply_a):
+                if reply_a == 'updated reply from A':
+                    write_store('agent-a', reply_a)
+                before = {path: path.read_bytes() for path in (agent_a, agent_b)}
+                result = self.run_script()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+                raw_path = sorted(output.glob('cursor_cli_*.jsonl'))[-1]
+                raw = self.rows(raw_path)
+                combined_path = sorted(output.glob('ALL_CONVERSATIONS_*.jsonl'))[-1]
+                combined = self.rows(combined_path)
+                self.assertEqual(len(raw), 2)
+                self.assertEqual(len(combined), 2)
+                self.assertCountEqual(combined, raw)
+                self.assertEqual(
+                    {(row['chat_id'], row['agent_id']) for row in combined},
+                    {('shared-chat', 'agent-a'), ('shared-chat', 'agent-b')},
+                )
+                self.assertEqual(
+                    {row['agent_id']: row['messages'][-1]['content']
+                     for row in combined},
+                    {'agent-a': reply_a, 'agent-b': 'reply from B'},
+                )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in before}, before,
+                )
+                if reply_a == 'first reply from A':
+                    # Keep an old export even if both runs share a filename second.
+                    raw_path.rename(output / 'cursor_cli_19990101_000000.jsonl')
+
     def test_empty_fixture_home_has_no_conversations_or_git_scan(self):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -269,6 +353,46 @@ class CombineSnapshotsTests(unittest.TestCase):
         self.assertEqual(
             combine_conversations.latest_conversations([snapshot, previous]),
             [unknown, unknown],
+        )
+
+
+    def test_cursor_composite_identity_preserves_other_agents_and_unknown_rows(self):
+        def cursor(chat_id, agent_id, content):
+            return {
+                'source': 'cursor-agent-cli',
+                'chat_id': chat_id,
+                'agent_id': agent_id,
+                'messages': [{'role': 'assistant', 'content': content}],
+            }
+
+        # These pairs collide if components are joined with a bare colon.
+        old_a = cursor('shared:a', 'b', 'old A')
+        retained_b = cursor('shared', 'a:b', 'retained B')
+        new_a = cursor('shared:a', 'b', 'new A')
+        unknown = [
+            cursor('unidentified', None, 'missing agent field'),
+            cursor('unidentified', None, 'null agent'),
+            cursor('unidentified', '', 'empty agent'),
+        ]
+        del unknown[0]['agent_id']
+
+        old_path = self.snapshot(
+            'cursor_cli_20260101_000000.jsonl',
+            [old_a, retained_b, *unknown],
+        )
+        new_path = self.snapshot(
+            'cursor_cli_20260102_000000.jsonl', [new_a],
+        )
+        before = {path: path.read_bytes() for path in (old_path, new_path)}
+        rows = combine_conversations.latest_conversations(
+            [new_path, old_path, new_path],
+        )
+
+        self.assertEqual(len(rows), 5)
+        self.assertCountEqual(rows, [new_a, retained_b, *unknown])
+        self.assertNotIn(old_a, rows)
+        self.assertEqual(
+            {path: path.read_bytes() for path in before}, before,
         )
 
     def test_invalid_snapshot_does_not_replace_combined_output(self):

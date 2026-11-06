@@ -25,6 +25,8 @@ import subprocess
 import sys
 from urllib.parse import unquote
 
+from conversation_ids import conversation_identifiers
+
 
 ISSUE_REF = re.compile(
     r'https?://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/[1-9]\d*\b'
@@ -466,10 +468,13 @@ def link_sessions(commits, sessions):
 
     links, seen = [], set()
     for session in sessions:
-        session_id = session.get('session_id')
-        if (not isinstance(session_id, (str, int)) or isinstance(session_id, bool)
-                or session_id == ''):
+        identifiers = conversation_identifiers(session)
+        if identifiers is None:
             continue
+        # Preserve native IDs; encode fallback fields without delimiter collisions.
+        identifiers_key = json.dumps(
+            identifiers, sort_keys=True, ensure_ascii=True, separators=(',', ':'))
+        session_id = identifiers.get('session_id', identifiers_key)
         window = session_window(session)
         if window is None:
             continue
@@ -480,6 +485,10 @@ def link_sessions(commits, sessions):
         identity = [value if isinstance(value, str) else None
                     for value in (source, profile, branch_id, source_file)]
         source, profile, branch_id, source_file = identity
+        installation = _value(session, 'installation')
+        workspace_id = _value(session, 'workspace_id')
+        namespace_key = json.dumps(
+            None if source_file else [installation, workspace_id], sort_keys=True)
         if not _declarations_agree(session, 'git_repository'):
             continue
         issues, branches = _session_references(session)
@@ -509,14 +518,16 @@ def link_sessions(commits, sessions):
                     if reference_match is None:
                         continue
                     basis, evidence = reference_match
-                key = (str(root), commit['sha'], session_id, *identity)
+                key = (str(root), commit['sha'], identifiers_key, *identity, namespace_key)
                 if key in seen:
                     continue
                 seen.add(key)
                 links.append({
                     'commit_sha': commit['sha'], 'git_repo_root': str(root),
                     'session_id': session_id, 'source': source, 'profile': profile,
+                    'session_identifiers': identifiers,
                     'branch_id': branch_id, 'source_file': source_file,
+                    'installation': installation, 'workspace_id': workspace_id,
                     'commit_time': commit['time'],
                     'session_start': _iso(window[0]), 'session_end': _iso(window[1]),
                     'path_field': match[0] if match else None,
@@ -528,6 +539,8 @@ def link_sessions(commits, sessions):
         row['git_repo_root'], row['commit_time'], row['commit_sha'],
         str(row['session_id']), row['source'] or '', row['profile'] or '',
         row['branch_id'] or '', row['source_file'] or '',
+        json.dumps(row['session_identifiers'], sort_keys=True),
+        json.dumps([row['installation'], row['workspace_id']], sort_keys=True),
     ))
 
 
@@ -584,4 +597,3 @@ def main(argv=None):
 
 if __name__ == '__main__':
     raise SystemExit(main())
-
