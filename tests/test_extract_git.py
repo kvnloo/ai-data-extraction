@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import extract_git
+import extract_pi
 from filter_privacy import discover_inputs, filter_jsonl
 
 
@@ -344,6 +345,185 @@ class ExtractGitTests(unittest.TestCase):
         self.assertTrue(link['candidate'])
         self.assertEqual((link['source'], link['profile'], link['branch_id'], link['source_file']),
                          ('hermes', 'work', 'conversation-leaf', '/exports/work/state.db'))
+
+    def test_cross_repository_tracker_references_keep_exact_namespaces(self):
+        self.git(self.repo, 'remote', 'add', 'origin',
+                 'https://github.com/example/code.git')
+        short_sha = self.commit(subject='Fix example/tracker#410')
+        url_sha = self.commit(
+            subject='Fix https://github.com/example/tracker/issues/410')
+        bare_sha = self.commit(subject='Fix #410')
+        self.commit(subject='Refs https://github.com/../tracker/issues/410 and '
+                            'https://github.com/example/../issues/410')
+        sessions = [
+            self.ask_session('Fix example/tracker#410.', 'tracker-short'),
+            self.ask_session('Fix https://github.com/example/tracker/issues/410',
+                             'tracker-url'),
+            self.ask_session('Fix example/tracker#410.', 'declared-code',
+                             metadata={'git_repository': 'example/code'}),
+            self.ask_session('Fix example/code#410.', 'origin-qualified'),
+            self.ask_session('Fix #410.', 'origin-bare',
+                             metadata={'git_repository': 'example/code'}),
+            self.ask_session('Fix #410.', 'unqualified'),
+            self.ask_session('Fix other/tracker#410.', 'wrong-tracker'),
+            self.ask_session('Fix example/tracker#411.', 'wrong-number'),
+            self.ask_session('Fix https://github.com/../tracker/issues/410',
+                             'invalid-owner'),
+            self.ask_session('Fix https://github.com/example/../issues/410',
+                             'invalid-repository'),
+            self.ask_session('Fix example/tracker#410.', 'outside-window',
+                             ended_at='2026-01-01T10:00:30Z'),
+            self.ask_session('Fix example/tracker#410.', 'foreign-declaration',
+                             metadata={'git_repository': 'example/tracker'}),
+        ]
+        for session in sessions:
+            session['source'] = 'hermes'
+        exported = self.root / 'tracker-sessions.jsonl'
+        exported.write_text(
+            ''.join(json.dumps(row) + '\n' for row in sessions), encoding='utf-8')
+        output = self.root / 'tracker-git-output'
+        with redirect_stdout(io.StringIO()):
+            status = extract_git.main([
+                str(self.repo), '--sessions', str(exported), '--output-dir', str(output),
+            ])
+        self.assertEqual(status, 0)
+        links = [json.loads(line) for line in
+                 next(output.glob('git_session_links_*.jsonl')).read_text(
+                     encoding='utf-8').splitlines()]
+        expected = {
+            (session_id, sha)
+            for session_id in ('tracker-short', 'tracker-url', 'declared-code')
+            for sha in (short_sha, url_sha)
+        } | {('origin-qualified', bare_sha), ('origin-bare', bare_sha)}
+        self.assertEqual(len(links), len(expected))
+        self.assertEqual({(row['session_id'], row['commit_sha']) for row in links},
+                         expected)
+        for link in links:
+            self.assertEqual(link['git_repository'], 'example/code')
+            self.assertEqual(link['git_repo_root'], str(self.repo))
+            self.assertEqual(link['source'], 'hermes')
+            self.assertIsNone(link['matched_path'])
+            self.assertEqual(link['match_basis'],
+                             'repository_issue_reference_and_time_window')
+            reference = 'example/code#410' if link['commit_sha'] == bare_sha else (
+                'example/tracker#410')
+            self.assertEqual(link['evidence'], [
+                {'kind': 'commit_issue_reference', 'reference': reference}])
+
+    def test_generated_summary_markers_cannot_supply_ask_evidence(self):
+        self.git(self.repo, 'remote', 'add', 'origin',
+                 'https://github.com/example/repo.git')
+        sha = self.commit(subject='Fix #410')
+        snapshot = self.root / 'summary-prs.json'
+        snapshot.write_text(json.dumps([self.pull_request(
+            sha, number=411, url='https://github.com/example/repo/pull/411')]),
+            encoding='utf-8')
+        commits = extract_git.extract_repositories(
+            [self.repo], extract_git.load_pull_requests([snapshot]))
+        cases = [
+            ('Fix example/repo#410.', 'repository_issue_reference_and_time_window'),
+            ('Review https://github.com/example/repo/pull/411',
+             'repository_pull_request_reference_and_time_window'),
+            ('Use example/repo@main.', 'repository_branch_reference_and_time_window'),
+        ]
+        markers = [
+            {'synthetic': True},
+            {'compaction_summary': True},
+            {'event': 'compaction'},
+            {'event': 'branch_summary'},
+        ]
+        for content, basis in cases:
+            ask = self.ask_session(content)
+            ask['messages'][0].update({
+                'synthetic': False, 'compaction_summary': False, 'event': 'message',
+            })
+            with self.subTest(content=content, control='genuine-user'):
+                expected = extract_git.link_sessions(commits, [ask])
+                self.assertEqual(len(expected), 1)
+                self.assertEqual(expected[0]['match_basis'], basis)
+                self.assertEqual(expected[0]['commit_sha'], sha)
+            for marker in markers:
+                with self.subTest(content=content, marker=marker):
+                    generated = {
+                        **ask,
+                        'messages': [{**ask['messages'][0], **marker}],
+                    }
+                    self.assertEqual(
+                        extract_git.link_sessions(commits, [generated]), [])
+                    mixed = {
+                        **generated,
+                        'messages': generated['messages'] + ask['messages'],
+                    }
+                    self.assertEqual(
+                        extract_git.link_sessions(commits, [mixed]), expected)
+
+    def test_pi_omp_generated_summaries_do_not_link_through_git_cli(self):
+        self.git(self.repo, 'remote', 'add', 'origin',
+                 'https://github.com/example/repo.git')
+        sha = self.commit(subject='Implement extraction')
+        conversations, expected_ids = [], set()
+        for source in ('pi', 'omp'):
+            for event in ('compaction', 'branch_summary'):
+                for has_ask in (False, True):
+                    session_id = f'{source}-{event}-{has_ask}'
+                    with self.subTest(source=source, event=event, has_ask=has_ask):
+                        rows = [
+                            {'type': 'session', 'id': session_id,
+                             'timestamp': '2026-01-01T10:00:00Z'},
+                            {'type': event, 'id': 'summary', 'parentId': None,
+                             'timestamp': '2026-01-01T10:00:30Z',
+                             'summary': 'Use example/repo@main.'},
+                        ]
+                        if has_ask:
+                            rows.append({
+                                'type': 'message', 'id': 'ask', 'parentId': 'summary',
+                                'timestamp': '2026-01-01T10:00:45Z',
+                                'message': {'role': 'user',
+                                            'content': 'Use example/repo@main.'},
+                            })
+                            expected_ids.add(session_id)
+                        rows.append({
+                            'type': 'message', 'id': 'answer',
+                            'parentId': 'ask' if has_ask else 'summary',
+                            'timestamp': '2026-01-01T10:02:00Z',
+                            'message': {'role': 'assistant', 'content': 'Continuing.'},
+                        })
+                        fixture = self.root / f'{session_id}.jsonl'
+                        fixture.write_text(
+                            ''.join(json.dumps(row) + '\n' for row in rows),
+                            encoding='utf-8')
+                        conversation = extract_pi.extract_session(fixture, source)
+                        self.assertIsNotNone(conversation)
+                        self.assertIsNone(conversation['project_path'])
+                        summary = conversation['messages'][0]
+                        self.assertEqual(summary['content'], 'Use example/repo@main.')
+                        self.assertEqual(summary['role'], 'user')
+                        self.assertEqual(summary['event'], event)
+                        self.assertTrue(summary['synthetic'])
+                        self.assertEqual(
+                            summary['compaction_summary'], event == 'compaction')
+                        conversations.append(conversation)
+
+        sessions = self.root / 'summary-conversations.jsonl'
+        sessions.write_text(
+            ''.join(json.dumps(row) + '\n' for row in conversations),
+            encoding='utf-8')
+        output = self.root / 'summary-git-output'
+        with redirect_stdout(io.StringIO()):
+            status = extract_git.main([
+                str(self.repo), '--sessions', str(sessions), '--output-dir', str(output),
+            ])
+        self.assertEqual(status, 0)
+        links = [json.loads(line) for line in
+                 next(output.glob('git_session_links_*.jsonl')).read_text(
+                     encoding='utf-8').splitlines()]
+        self.assertEqual(len(links), len(expected_ids))
+        self.assertEqual({row['session_id'] for row in links}, expected_ids)
+        self.assertEqual({row['source'] for row in links}, {'pi', 'omp'})
+        self.assertTrue(all(row['commit_sha'] == sha for row in links))
+        self.assertTrue(all(
+            row['match_basis'] == 'repository_branch_reference_and_time_window'
+            for row in links))
 
     def test_branch_asks_use_exact_qualified_current_refs_and_closed_windows(self):
         self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')

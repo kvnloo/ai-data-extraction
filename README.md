@@ -181,11 +181,15 @@ upper bound. Missing bounds and invalid windows remain unlinked.
 When path metadata is absent, matching requires a canonical GitHub repository
 with one unambiguous selected checkout plus repository-qualified evidence:
 `owner/repo#N`, a GitHub issue/pull URL, `owner/repo@branch`, or a GitHub
-`/tree/<branch>` URL in user messages. Explicit `git_repository` and
-`git_branch` session metadata are also supported. Bare issue numbers require
-an explicitly recorded repository; origin and upstream forks are never treated
-as interchangeable issue namespaces. If several selected worktrees share the
-repository identity, path-free linking stays unassigned.
+`/tree/<branch>` URL in genuine user messages. Synthetic messages, compaction
+summaries and branch summaries remain in the corpus but do not supply ask
+references. Explicit `git_repository` and `git_branch` session metadata are
+also supported. Qualified issue references match the exact tracker repository
+and number, even when the tracker differs from the code repository. Bare issue
+numbers in commit messages are scoped to the checkout's origin; bare numbers in
+asks require an explicitly recorded repository. Origin and upstream forks are
+never treated as interchangeable issue namespaces. If several selected worktrees
+share the repository identity, path-free linking stays unassigned.
 
 Matching records retain source/profile/session identity and the matching
 evidence. They are candidate associations, not proof of authorship.

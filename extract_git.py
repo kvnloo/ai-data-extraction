@@ -88,7 +88,8 @@ def _issue_key(reference, default_repository=None):
         r'https?://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/([1-9]\d*)',
         reference)
     if match:
-        return _repository_name(match[1]), int(match[2])
+        repository = _repository_name(match[1])
+        return (repository, int(match[2])) if repository else None
     match = re.fullmatch(r'([\w.-]+/[\w.-]+)?#([1-9]\d*)', reference)
     if match:
         repository = _repository_name(match[1]) if match[1] else default_repository
@@ -383,14 +384,16 @@ def _consistent_path_match(session, root, roots):
 
 
 def _session_references(session):
-    """Only explicit user asks and qualified metadata are evidence, never echoes."""
+    """Only genuine user asks and qualified metadata are evidence, never echoes."""
     repository = _repository_name(_value(session, 'git_repository'))
     issues, branches = set(), set()
     branch = _value(session, 'git_branch')
     if repository and _valid_branch(branch):
         branches.add((repository, branch))
     for message in session.get('messages', []):
-        if not isinstance(message, dict) or message.get('role') != 'user':
+        if (not isinstance(message, dict) or message.get('role') != 'user'
+                or message.get('synthetic') or message.get('compaction_summary')
+                or message.get('event') in ('compaction', 'branch_summary')):
             continue
         content = message.get('content')
         if isinstance(content, list):
@@ -416,9 +419,9 @@ def _reference_match(commit, issues, branches):
     repository = commit.get('git_repository')
     if not repository:
         return None
+    # Qualified references retain their tracker; only bare #N inherits the origin.
     commit_issues = {key for reference in commit.get('issue_refs', [])
-                     if (key := _issue_key(reference, repository)) is not None
-                     and key[0] == repository}
+                     if (key := _issue_key(reference, repository)) is not None}
     matched = sorted(commit_issues & issues)
     if matched:
         return 'repository_issue_reference_and_time_window', [
