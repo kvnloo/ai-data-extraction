@@ -1,3 +1,4 @@
+from datetime import datetime
 import io
 import json
 import os
@@ -99,6 +100,54 @@ class ExtractHermesTests(unittest.TestCase):
         self.assertNotIn('cwd', conversation)
         self.assertNotIn('git_repo_root', conversation)
         self.assertEqual(path.read_bytes(), original)
+
+    def test_preserves_recorded_per_call_token_columns_without_session_inference(self):
+        path, writer = self.database()
+        fields = ('input_tokens', 'output_tokens', 'cache_read_tokens',
+                  'cache_write_tokens', 'reasoning_tokens')
+        for field in fields:
+            writer.execute(f'ALTER TABLE messages ADD COLUMN {field} INTEGER')
+        self.add_messages(writer, [
+            ('session-1', 'user', 'Inspect files', None, None, 1001),
+            ('session-1', 'assistant', 'First call', None, None, 1002),
+            ('session-1', 'assistant', 'Second call', None, None, 1003),
+        ])
+        writer.execute('''UPDATE messages SET input_tokens=123, output_tokens=45,
+            cache_read_tokens=0, cache_write_tokens=7, reasoning_tokens=11
+            WHERE timestamp=1002''')
+        writer.execute('''UPDATE messages SET input_tokens=9, output_tokens=0,
+            cache_read_tokens=2, cache_write_tokens=NULL, reasoning_tokens=0
+            WHERE timestamp=1003''')
+        writer.commit()
+        original = path.read_bytes()
+
+        conversation, = extract_hermes.extract_database(path)
+        messages = conversation['messages']
+        self.assertEqual({field: messages[0][field] for field in fields},
+                         dict.fromkeys(fields))
+        self.assertEqual({field: messages[1][field] for field in fields}, {
+            'input_tokens': 123, 'output_tokens': 45, 'cache_read_tokens': 0,
+            'cache_write_tokens': 7, 'reasoning_tokens': 11,
+        })
+        self.assertEqual({field: messages[2][field] for field in fields}, {
+            'input_tokens': 9, 'output_tokens': 0, 'cache_read_tokens': 2,
+            'cache_write_tokens': None, 'reasoning_tokens': 0,
+        })
+        self.assertEqual(conversation['metadata']['input_tokens'], 100)
+        self.assertEqual(conversation['metadata']['output_tokens'], 30)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_missing_message_token_columns_remain_absent(self):
+        path, writer = self.database()
+        self.add_messages(writer, [
+            ('session-1', 'assistant', 'No recorded call usage', None, None, 1002),
+        ])
+        conversation, = extract_hermes.extract_database(path)
+        self.assertEqual(conversation['messages'], [{
+            'role': 'assistant', 'content': 'No recorded call usage',
+            'timestamp': '1970-01-01T00:16:42Z',
+        }])
+        self.assertEqual(conversation['metadata']['input_tokens'], 100)
 
     def test_discovers_all_profiles_without_collapsing_equal_session_ids(self):
         default, _ = self.database()
@@ -220,6 +269,55 @@ class ExtractHermesTests(unittest.TestCase):
         self.assertEqual(stats.records, 1)
         self.assertEqual(path.read_bytes(), original)
 
+    def test_same_second_exports_preserve_both_snapshots(self):
+        _, writer = self.database()
+        self.add_messages(writer, [
+            ('session-1', 'assistant', 'First snapshot', None, None, 1002),
+        ])
+        output = self.root / 'output'
+        arguments = ['--hermes-dir', str(self.root), '--output-dir', str(output)]
+        with patch.object(extract_hermes, 'datetime', wraps=datetime) as clock, \
+                patch('sys.stdout', new_callable=io.StringIO):
+            clock.now.side_effect = [datetime(2026, 1, 1, 10, 0, 0, 100),
+                                     datetime(2026, 1, 1, 10, 0, 0, 200)]
+            self.assertEqual(extract_hermes.main(arguments), 0)
+            first, = output.glob('hermes_conversations_*.jsonl')
+            original = first.read_bytes()
+            writer.execute("UPDATE messages SET content='Second snapshot'")
+            writer.commit()
+            self.assertEqual(extract_hermes.main(arguments), 0)
+
+        exports = sorted(output.glob('hermes_conversations_*.jsonl'))
+        self.assertEqual(len(exports), 2)
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(
+            [json.loads(path.read_text(encoding='utf-8'))['messages'][0]['content']
+             for path in exports],
+            ['First snapshot', 'Second snapshot'],
+        )
+
+    def test_exact_export_name_collision_fails_without_overwriting_snapshot(self):
+        _, writer = self.database()
+        self.add_messages(writer, [
+            ('session-1', 'assistant', 'Original snapshot', None, None, 1002),
+        ])
+        output = self.root / 'output'
+        arguments = ['--hermes-dir', str(self.root), '--output-dir', str(output)]
+        with patch.object(extract_hermes, 'datetime', wraps=datetime) as clock, \
+                patch('sys.stdout', new_callable=io.StringIO), \
+                patch('sys.stderr', new_callable=io.StringIO) as errors:
+            clock.now.return_value = datetime(2026, 1, 1, 10, 0, 0, 100)
+            self.assertEqual(extract_hermes.main(arguments), 0)
+            exported, = output.glob('hermes_conversations_*.jsonl')
+            original = exported.read_bytes()
+            writer.execute("UPDATE messages SET content='Changed snapshot'")
+            writer.commit()
+            self.assertEqual(extract_hermes.main(arguments), 1)
+
+        self.assertEqual(list(output.glob('hermes_conversations_*.jsonl')), [exported])
+        self.assertEqual(exported.read_bytes(), original)
+        self.assertIn('error:', errors.getvalue())
+
     def test_cli_uses_environment_root_without_home_discovery(self):
         self.database()
         with patch.dict(os.environ, {'HERMES_HOME': str(self.root)}), \
@@ -241,3 +339,4 @@ class ExtractHermesTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

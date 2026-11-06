@@ -109,6 +109,11 @@ def _message(row):
         'timestamp': _timestamp(row.get('timestamp')),
     }
     message.update(_tool_calls(row.get('tool_calls')))
+    # Per-call counters belong to the recorded message, not the session total.
+    # Preserve provider-specific token columns too, including explicit NULL/0;
+    # an absent column stays absent rather than becoming an invented count.
+    message.update({key: value for key, value in row.items()
+                    if key.endswith('_tokens')})
     if role == 'tool':
         message['name'] = row.get('tool_name')
         # The baseline schema has no result ID. Never guess ownership from the
@@ -121,8 +126,9 @@ def _message(row):
 def extract_database(database, profile='default'):
     """Export one coherent snapshot, including committed WAL rows, without writes.
 
-    Session counters are copied, not inferred from messages. Empty sessions are
-    retained with messages=[] because they can still carry usage information.
+    Session counters and recorded per-message token columns are copied without
+    inference. Empty sessions are retained with messages=[] because they can
+    still carry usage information.
     Unreadable databases warn on stderr and return no records, allowing other
     profiles to export in the same best-effort run.
     """
@@ -216,9 +222,9 @@ def main(argv=None):
             return 0
         print(f"Total messages: {sum(len(c['messages']) for c in conversations):,}")
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         output_file = args.output_dir / f'hermes_conversations_{timestamp}.jsonl'
-        with output_file.open('w', encoding='utf-8') as destination:
+        with output_file.open('x', encoding='utf-8') as destination:
             for conversation in conversations:
                 destination.write(json.dumps(conversation, ensure_ascii=False) + '\n')
         print(f'✅ Saved to: {output_file}')
@@ -232,3 +238,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     raise SystemExit(main())
+

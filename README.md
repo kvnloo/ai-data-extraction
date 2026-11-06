@@ -131,9 +131,14 @@ format. The top-level `source` is `hermes`; `metadata.source` preserves the
 session's original channel. Metadata also retains `model`, `profile`,
 `api_call_count`, `input_tokens`, `cache_read_tokens`, `cache_write_tokens`,
 `output_tokens`, `tool_call_count`, session boundaries and parent session ID.
-Unknown counts remain null. Tool calls, tool results and sessions with no
-messages are retained so session usage is preserved. Profile and source-file
-metadata distinguish identical session IDs in different databases.
+Unknown session counts remain null. Each message also preserves its recorded
+per-call token columns, including input/output/cache counters and other columns
+ending in `_tokens`. Explicit zero/null values survive; absent message columns
+stay absent, without borrowing session totals. Tool calls, tool results and
+sessions with no messages are retained. Profile and source-file metadata
+distinguish identical session IDs in different databases. Export filenames
+include microseconds and use exclusive creation; an exact filename collision
+fails without overwriting the previous snapshot.
 Unreadable databases emit stderr warnings and are skipped so other profiles can
 export; this best-effort run can still exit successfully. Check the extraction
 log before treating an export as complete.
@@ -142,26 +147,49 @@ log before treating an export as complete.
 
 Reads commits reachable from local refs and HEAD in explicitly supplied
 repositories. Each commit includes its SHA, author, committer time, subject,
-changed paths and issue references. It writes separate JSONL tables to
-`extracted_data/git/`:
+changed paths and issue references. With a supported HTTPS or SSH GitHub origin,
+it also records the canonical `git_repository`. Local branch records retain their
+names, full refs and tip SHAs as observed during extraction. They describe current reachability,
+not the branch that necessarily held a commit during a past session.
 
-- `git_commits_TIMESTAMP.jsonl`: commit records.
+The separate JSONL tables live in `extracted_data/git/`:
+
+- `git_commits_TIMESTAMP.jsonl`: commit records and branch/PR evidence.
 - `git_session_links_TIMESTAMP.jsonl`: candidate commit-to-session matches.
+- `git_pull_requests_TIMESTAMP.jsonl`: validated PR snapshots when
+  `--pull-requests` is supplied.
+
+PR input is an explicitly supplied JSON array in GitHub CLI export format.
+Each object contains `url`, `number`, `title`, `state`, `headRefName`,
+`baseRefName` and `headRefOid`; optional `mergeCommit` contains an `oid`.
+The extractor validates the repository-qualified URL and commit IDs, requires
+PR repositories to match supplied origins, and ties a PR to a local commit only
+through an exact recorded head or merge SHA. A non-null `mergeCommit` is accepted
+only for `MERGED` records; conflicting snapshots are rejected.
+It does not fetch remote history or query PR APIs.
 
 The Git extractor requires Python 3.9+ and a local Git executable. Export names
-include microseconds to support immediate repeated runs. Non-UTF-8 filename
-bytes are rendered as literal `\xNN` escapes for privacy-filter compatibility.
+include microseconds. Non-UTF-8 filename bytes become literal `\xNN` escapes
+for privacy-filter compatibility.
 
-A link requires both a bounded session time window and matching repository
-metadata. The extractor uses `git_repo_root`, or a `cwd` / `project_path`
-within the repository. When the session has no end time, its last timestamped
-message supplies the upper bound. Missing paths, missing bounds and invalid
-windows remain unlinked. Hermes' basic sessions table has no path columns;
-optional `cwd` and `git_repo_root` columns are preserved when present.
+Every link requires a bounded session time window. With path metadata, the
+extractor uses `git_repo_root`, or a `cwd` / `project_path` within the selected
+repository. Contradictory or invalid paths cannot be overridden by ask text.
+When the session has no end time, its last timestamped message supplies the
+upper bound. Missing bounds and invalid windows remain unlinked.
 
-Matching records retain their source/profile/session identity and evidence;
-overlapping sessions can produce multiple candidates. Git is read locally;
-the extractor does not fetch remote history or query pull-request APIs.
+When path metadata is absent, matching requires a canonical GitHub repository
+with one unambiguous selected checkout plus repository-qualified evidence:
+`owner/repo#N`, a GitHub issue/pull URL, `owner/repo@branch`, or a GitHub
+`/tree/<branch>` URL in user messages. Explicit `git_repository` and
+`git_branch` session metadata are also supported. Bare issue numbers require
+an explicitly recorded repository; origin and upstream forks are never treated
+as interchangeable issue namespaces. If several selected worktrees share the
+repository identity, path-free linking stays unassigned.
+
+Matching records retain source/profile/session identity and the matching
+evidence. They are candidate associations, not proof of authorship.
+Overlapping sessions can still produce several candidates.
 
 ```bash
 python3 extract_hermes.py
@@ -170,18 +198,30 @@ python3 extract_hermes.py --hermes-dir /path/to/hermes --output-dir extracted_da
 python3 extract_git.py /path/to/repository \
   --sessions extracted_data/hermes_conversations_TIMESTAMP.jsonl
 
+python3 extract_git.py /path/to/repository \
+  --sessions extracted_data/ALL_CONVERSATIONS_TIMESTAMP.jsonl \
+  --pull-requests /path/to/pull_requests.json
+
 # Repository paths are forwarded to Git after conversation extraction.
 ./extract_all.sh /path/to/repository /path/to/another-repository
 ```
 
 `--sessions` can be repeated and accepts JSONL files or directories.
-`--output-dir` changes the Git table directory. With no repository arguments,
-`extract_all.sh` extracts conversations and skips Git. It excludes previous
-`ALL_CONVERSATIONS_*` files from recombination and keeps Git tables outside
-the conversation corpus. Existing extractor snapshots remain inputs.
+`--pull-requests` can be repeated. `--output-dir` changes the Git table
+directory. With no repository arguments, `extract_all.sh` extracts
+conversations and skips Git. It excludes previous `ALL_CONVERSATIONS_*` files
+from recombination and keeps Git tables outside the conversation corpus.
+
+`combine_conversations.py` selects the newest snapshot for each
+source/profile/session identity, keeping source databases/files distinct.
+All branch leaves present in that session's newest snapshot survive; older leaf
+IDs are replaced as the session grows. Export timestamps in filenames determine
+recency; unrecognized names fall back to filesystem modification times. A session
+absent from a newer snapshot remains available from its latest older snapshot.
+Records without a stable source/session ID are retained separately.
 
 The recursive `filter_privacy.py` workflow includes the Git subdirectory, so
-commit metadata and link evidence are filtered along with conversations:
+commit metadata, PR snapshots and link evidence are filtered with conversations:
 
 ```bash
 python3 filter_privacy.py extracted_data --output-dir filtered_data
@@ -355,8 +395,8 @@ Each script follows this pattern:
 ### Merge All Extractions
 
 ```bash
-# Combine all JSONL files
-cat extracted_data/*.jsonl > all_conversations.jsonl
+# Keep the newest snapshot of each conversation; prior combined files are excluded.
+python3 combine_conversations.py extracted_data/*.jsonl --output all_conversations.jsonl
 
 # Count total conversations
 wc -l all_conversations.jsonl
@@ -372,12 +412,20 @@ OpenAI-compatible chat-completions model to synthesize reusable
 [Agent Skills](https://agentskills.io/specification). Each result is written as
 `<skill-name>/SKILL.md` with validated `name` and `description` metadata.
 
-The command is local-first: unless `OPENAI_BASE_URL` is set, it connects to
-`http://127.0.0.1:8000/v1`. Point it at a locally served model and a filtered
-corpus:
+The PRIV2 route gate defaults to `--corpus-tier private` and refuses to send
+private text through the default `openai-compatible` provider. Filtering does
+not promote a corpus to public. The check runs before CLI corpus reads and
+again in `call_model()`.
+
+For local inference, explicitly select `--provider local` and a numeric loopback
+endpoint (`127.0.0.1` or `::1`). This declares that the server runs the model
+locally; a loopback cloud relay is not a local provider. The default base URL is
+`http://127.0.0.1:8000/v1` unless `OPENAI_BASE_URL` is set:
 
 ```bash
 python3 corpus_to_skills.py filtered_data \
+  --provider local --corpus-tier private \
+  --base-url http://127.0.0.1:8000/v1 \
   --model your-local-model \
   --skills 5 \
   --output-dir generated_skills
@@ -389,9 +437,21 @@ character budget, treats corpus content as untrusted data, validates the model's
 JSON response, and refuses to overwrite existing skills unless `--overwrite`
 is passed.
 
-Review every generated skill before installing it. Filter the extracted corpus
-first, especially before explicitly configuring a remote API endpoint; model
-output can still repeat sensitive source material despite prompt-level guards.
+Private text may also use `--provider anthropic`, a Claude model ID, and the
+exact endpoint `https://api.anthropic.com/v1`. Use
+`--api-key-env ANTHROPIC_API_KEY` with a workspace-scoped API key. This route uses
+[Claude's documented OpenAI-compatible API](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk).
+
+Only explicitly approved public metadata, code or benchmark inputs may use
+`--corpus-tier public --provider openai-compatible` with another provider.
+Remote endpoints require HTTPS; local relays may use numeric loopback HTTP.
+A `filtered_data` directory or `_pub` filename never changes the classification.
+The local-provider and public-tier options are operator declarations, not
+content classifiers. Requests ignore environment proxies and reject redirects
+so the validated endpoint cannot silently change.
+
+Review every generated skill before installing it; output can still repeat
+source material despite prompt-level guards.
 
 ### Filter by Date
 

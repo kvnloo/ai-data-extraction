@@ -122,10 +122,9 @@ for conversation_file in extracted_data/*.jsonl; do
     conversation_files+=("$conversation_file")
 done
 combined_file="extracted_data/ALL_CONVERSATIONS_$(date +%Y%m%d_%H%M%S).jsonl"
-if [ ${#conversation_files[@]} -gt 0 ]; then
-    cat "${conversation_files[@]}" > "$combined_file"
-else
-    : > "$combined_file"
+if ! python3 combine_conversations.py --output "$combined_file" "${conversation_files[@]}"; then
+    echo "❌ Conversation aggregation failed." >&2
+    exit 1
 fi
 
 # Repository paths are explicit arguments; no repositories are auto-discovered.

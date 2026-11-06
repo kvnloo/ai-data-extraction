@@ -85,8 +85,10 @@ class ExtractGitTests(unittest.TestCase):
         record = records[0]
         self.assertEqual(record['sha'], sha)
         self.assertEqual(record['author'], 'Fixture')
-        self.assertEqual(record['time'], '2026-01-01T10:01:00+00:00')
-        self.assertEqual(record['author_time'], '2026-01-01T09:00:00+00:00')
+        self.assertEqual(extract_git.parse_timestamp(record['time']),
+                         datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(extract_git.parse_timestamp(record['author_time']),
+                         datetime(2026, 1, 1, 9, tzinfo=timezone.utc).timestamp())
         self.assertEqual(record['subject'], 'Implement #12')
         self.assertEqual(record['files_changed'], sorted(names))
         self.assertEqual(record['issue_refs'],
@@ -296,5 +298,275 @@ class ExtractGitTests(unittest.TestCase):
         self.assertEqual([row['sha'] for row in records], [expected])
 
 
+    def ask_session(self, content, session_id='ask', **extra):
+        fields = {
+            'cwd': None,
+            'messages': [{'role': 'user', 'content': content,
+                          'timestamp': '2026-01-01T10:02:00Z'}],
+        }
+        fields.update(extra)
+        return self.session(session_id, **fields)
+
+    def pull_request(self, sha, **extra):
+        return {
+            'url': 'https://github.com/example/repo/pull/410', 'number': 410,
+            'title': 'Fix extraction evidence', 'state': 'OPEN',
+            'headRefName': 'feat/issue-410', 'baseRefName': 'main',
+            'headRefOid': sha, 'mergeCommit': None, **extra,
+        }
+
+    def test_local_branch_metadata_and_qualified_issue_ask_without_path(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'git@github.com:example/repo.git')
+        sha = self.commit(subject='Fix #410')
+        self.git(self.repo, 'branch', 'feat/issue-410')
+        records = extract_git.extract_repositories([self.repo])
+        record = records[0]
+        self.assertEqual(record['git_repository'], 'example/repo')
+        self.assertEqual(record['pull_requests'], [])
+        branch = next(row for row in record['branches'] if row['name'] == 'feat/issue-410')
+        self.assertEqual(branch, {
+            'name': 'feat/issue-410', 'ref': 'refs/heads/feat/issue-410',
+            'tip_sha': sha, 'evidence_kind': 'current_ref_reachability',
+        })
+        ask = self.ask_session('Fix example/repo#410.', source='hermes',
+                               source_file='/exports/work/state.db',
+                               branch_id='conversation-leaf',
+                               metadata={'profile': 'work'})
+        links = extract_git.link_sessions(records, [ask, ask])
+        self.assertEqual(len(links), 1)
+        link = links[0]
+        self.assertEqual(link['commit_sha'], sha)
+        self.assertEqual(link['match_basis'], 'repository_issue_reference_and_time_window')
+        self.assertEqual(link['evidence'], [
+            {'kind': 'commit_issue_reference', 'reference': 'example/repo#410'}])
+        self.assertIsNone(link['path_field'])
+        self.assertIsNone(link['matched_path'])
+        self.assertTrue(link['candidate'])
+        self.assertEqual((link['source'], link['profile'], link['branch_id'], link['source_file']),
+                         ('hermes', 'work', 'conversation-leaf', '/exports/work/state.db'))
+
+    def test_branch_asks_use_exact_qualified_current_refs_and_closed_windows(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        self.commit(subject='Implement extraction')
+        self.git(self.repo, 'branch', 'feat/issue-410')
+        records = extract_git.extract_repositories([self.repo])
+        sessions = [
+            self.ask_session('Work on example/repo@feat/issue-410.', 'qualified'),
+            self.ask_session('Use https://github.com/example/repo/tree/feat/issue-410', 'url'),
+            self.ask_session('Use `example/repo@feat/issue-410`.', 'inline-code'),
+            self.ask_session('Use "https://github.com/example/repo/tree/feat/issue-410".',
+                             'quoted-url'),
+            self.ask_session('Continue.', 'metadata',
+                             metadata={'git_repository': 'example/repo',
+                                       'git_branch': 'feat/issue-410'}),
+            self.ask_session('Work on feat/issue-410.', 'unqualified'),
+            self.ask_session('Use example/repo@feat/issue-41.', 'prefix'),
+            self.ask_session('Use other/repo@feat/issue-410.', 'foreign'),
+            self.ask_session('Use example/repo@feat/issue-410.', 'late',
+                             timestamp='2026-01-01T10:03:00Z'),
+            self.ask_session('Use example/repo@feat/issue-410.', 'unbounded',
+                             timestamp=None, messages=[]),
+            self.ask_session('', 'assistant', messages=[
+                {'role': 'assistant', 'content': 'Use example/repo@feat/issue-410.',
+                 'timestamp': '2026-01-01T10:02:00Z'}]),
+            self.ask_session('', 'conversation-branch', branch_id='feat/issue-410'),
+            self.ask_session('Use example/repo@feat/issue-410.', 'conflicting-branches',
+                             git_repository='example/repo', git_branch='feat/issue-410',
+                             metadata={'git_branch': 'different'}),
+        ]
+        links = extract_git.link_sessions(records, sessions)
+        self.assertEqual({row['session_id'] for row in links},
+                         {'qualified', 'url', 'metadata', 'inline-code', 'quoted-url'})
+        for link in links:
+            self.assertEqual(link['match_basis'], 'repository_branch_reference_and_time_window')
+            self.assertEqual(link['evidence'][0]['kind'], 'current_ref_reachability')
+            self.assertEqual(link['evidence'][0]['branch'], 'feat/issue-410')
+
+    def test_issue_references_do_not_cross_repositories_with_shared_shas(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        self.git(self.repo, 'remote', 'add', 'upstream', 'https://github.com/other/repo.git')
+        sha = self.commit(subject='Fix #410')
+        other = self.init_repo(self.root / 'other')
+        self.git(other, 'remote', 'add', 'origin', 'https://github.com/other/repo.git')
+        self.assertEqual(self.commit(other, subject='Fix #410'), sha)
+        records = extract_git.extract_repositories([self.repo, other])
+        sessions = [
+            self.ask_session('Fix example/repo#410.', 'qualified'),
+            self.ask_session('Fix https://github.com/example/repo/issues/410', 'url'),
+            self.ask_session('Fix #410.', 'bare'),
+            self.ask_session('Fix #410.', 'metadata',
+                             metadata={'git_repository': 'example/repo'}),
+        ]
+        links = extract_git.link_sessions(records, sessions)
+        self.assertEqual({row['session_id'] for row in links}, {'qualified', 'url', 'metadata'})
+        self.assertTrue(all(row['git_repo_root'] == str(self.repo) for row in links))
+        foreign = self.commit(subject='Refs other/repo#411')
+        records = extract_git.extract_repositories([self.repo])
+        links = extract_git.link_sessions(records, [self.ask_session('Fix example/repo#411.')])
+        self.assertEqual(links, [])
+        self.assertIn(foreign, {row['sha'] for row in records})
+
+    def test_pathless_references_reject_ambiguous_worktrees(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        self.commit(subject='Fix #410')
+        worktree = self.root / 'worktree'
+        self.git(self.repo, 'worktree', 'add', '--quiet', '-b', 'work', str(worktree))
+        records = extract_git.extract_repositories([self.repo, worktree])
+        ask = self.ask_session('Fix example/repo#410.')
+        self.assertEqual(extract_git.link_sessions(records, [ask]), [])
+        located = self.ask_session('Fix example/repo#410.', cwd=str(worktree))
+        links = extract_git.link_sessions(records, [located])
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]['git_repo_root'], str(worktree))
+
+    def test_invalid_or_conflicting_paths_cannot_fall_back_to_text_evidence(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        self.commit(subject='Fix #410')
+        records = extract_git.extract_repositories([self.repo])
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.repo / 'link').symlink_to(outside, target_is_directory=True)
+        sessions = [
+            self.ask_session('Fix example/repo#410.', 'relative', cwd='src'),
+            self.ask_session('Fix example/repo#410.', 'wrong', cwd=str(outside)),
+            self.ask_session('Fix example/repo#410.', 'symlink',
+                             cwd=str(self.repo / 'link' / 'src')),
+            self.ask_session('Fix example/repo#410.', 'conflicting',
+                             git_repo_root=str(self.repo), cwd=str(outside)),
+            self.ask_session('Fix example/repo#410.', 'metadata-path',
+                             cwd=str(self.repo), metadata={'cwd': str(outside)}),
+            self.ask_session('Fix example/repo#410.', 'invalid-repo',
+                             metadata={'git_repository': 'not-qualified'}),
+            self.ask_session('Fix example/repo#410.', 'foreign-metadata',
+                             metadata={'git_repository': 'other/repo'}),
+            self.ask_session('Fix #410.', 'conflicting-repositories',
+                             git_repository='example/repo',
+                             metadata={'git_repository': 'other/repo'}),
+        ]
+        self.assertEqual(extract_git.link_sessions(records, sessions), [])
+
+    def test_valid_path_evidence_survives_unrelated_repository_references(self):
+        self.commit(subject='Fix #410')
+        ask = self.ask_session('Compare other/repo#410 and example/repo@topic.',
+                               cwd=str(self.repo))
+        for with_origin in (False, True):
+            with self.subTest(with_origin=with_origin):
+                if with_origin:
+                    self.git(self.repo, 'remote', 'add', 'origin',
+                             'https://github.com/example/repo.git')
+                records = extract_git.extract_repositories([self.repo])
+                links = extract_git.link_sessions(records, [ask])
+                self.assertEqual(len(links), 1)
+                self.assertEqual(links[0]['match_basis'], 'repository_path_and_time_window')
+                self.assertEqual(links[0]['matched_path'], str(self.repo))
+
+    def test_pull_request_snapshot_exports_only_exact_head_and_merge_evidence(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        earlier = self.commit(subject='Earlier unrelated change')
+        head = self.commit(subject='Implement extraction')
+        merged = self.commit(subject='Merge extraction')
+        snapshot = self.root / 'pull-requests.json'
+        snapshot.write_text(json.dumps([self.pull_request(
+            head, state='MERGED', mergeCommit={'oid': merged})]), encoding='utf-8')
+        pull_requests = extract_git.load_pull_requests([snapshot])
+        records = {row['sha']: row for row in extract_git.extract_repositories(
+            [self.repo], pull_requests)}
+        self.assertEqual(records[earlier]['pull_requests'], [])
+        self.assertEqual(records[head]['pull_requests'][0]['commit_relationship'], 'head_sha')
+        self.assertEqual(records[merged]['pull_requests'][0]['commit_relationship'], 'merge_sha')
+        links = extract_git.link_sessions(list(records.values()), [
+            self.ask_session('Review https://github.com/example/repo/pull/410'),
+            self.ask_session('Review example/repo#410', 'outside',
+                             ended_at='2026-01-01T10:00:30Z'),
+        ])
+        self.assertEqual({row['commit_sha'] for row in links}, {head, merged})
+        self.assertTrue(all(row['session_id'] == 'ask' for row in links))
+        self.assertTrue(all(row['match_basis'] ==
+                            'repository_pull_request_reference_and_time_window' for row in links))
+        self.assertTrue(all(row['evidence'][0]['evidence_source'] == str(snapshot) for row in links))
+
+    def test_pull_request_snapshot_cli_emits_filterable_separate_table(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        sha = self.commit(subject='Implement extraction')
+        snapshot = self.root / 'pull-requests.json'
+        snapshot.write_text(json.dumps([self.pull_request(sha)]), encoding='utf-8')
+        sessions = self.root / 'sessions.jsonl'
+        sessions.write_text(json.dumps(self.ask_session('Fix example/repo#410.')) + '\n',
+                            encoding='utf-8')
+        output = self.root / 'pr-output'
+        with redirect_stdout(io.StringIO()):
+            status = extract_git.main([str(self.repo), '--sessions', str(sessions),
+                                       '--pull-requests', str(snapshot),
+                                       '--output-dir', str(output)])
+        self.assertEqual(status, 0)
+        self.assertEqual(len(list(output.glob('*.jsonl'))), 3)
+        self.assertEqual(len(discover_inputs([output])), 3)
+        pr_file = next(output.glob('git_pull_requests_*.jsonl'))
+        record = json.loads(pr_file.read_text(encoding='utf-8'))
+        self.assertEqual(record['git_repository'], 'example/repo')
+        self.assertEqual(record['head_sha'], sha)
+        self.assertEqual(record['head_branch'], 'feat/issue-410')
+        self.assertEqual(record['base_branch'], 'main')
+        self.assertEqual(record['evidence_kind'], 'exported_pull_request_snapshot')
+        filtered = self.root / 'filtered-pr.jsonl'
+        self.assertEqual(filter_jsonl(pr_file, filtered, lambda value: value).records, 1)
+        self.assertEqual(json.loads(filtered.read_text(encoding='utf-8')), record)
+
+    def test_invalid_or_foreign_pull_request_snapshots_fail_without_output(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        sha = self.commit()
+        snapshot = self.root / 'invalid-prs.json'
+        invalid = [
+            {'not': 'an array'},
+            [self.pull_request(sha, number=True)],
+            [self.pull_request(sha, number=411)],
+            [self.pull_request('not-a-sha')],
+            [self.pull_request(sha, headRefName='../branch')],
+            [self.pull_request(sha, state='MERGED', mergeCommit={'oid': 'invalid'})],
+            [self.pull_request(sha, mergeCommit={'oid': sha})],
+            [self.pull_request(sha, state='CLOSED', mergeCommit={'oid': sha})],
+            [self.pull_request(sha, url='https://github.com/other/repo/pull/410')],
+            [self.pull_request(sha), self.pull_request(sha, state='CLOSED')],
+        ]
+        for index, records in enumerate(invalid):
+            with self.subTest(index=index):
+                snapshot.write_text(json.dumps(records), encoding='utf-8')
+                output = self.root / f'invalid-output-{index}'
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    status = extract_git.main([str(self.repo), '--pull-requests', str(snapshot),
+                                               '--output-dir', str(output)])
+                self.assertEqual(status, 1)
+                self.assertFalse(output.exists())
+
+    def test_empty_repository_can_export_pr_snapshot_without_inventing_links(self):
+        self.git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git')
+        other = self.init_repo(self.root / 'snapshot-source')
+        sha = self.commit(other, subject='Snapshot commit outside the empty checkout')
+        snapshot = self.root / 'pull-requests.json'
+        snapshot.write_text(json.dumps([self.pull_request(sha)]), encoding='utf-8')
+        sessions = self.root / 'sessions.jsonl'
+        sessions.write_text(json.dumps(self.ask_session('Fix example/repo#410.')) + '\n',
+                            encoding='utf-8')
+        output = self.root / 'empty-pr-output'
+        with redirect_stdout(io.StringIO()):
+            status = extract_git.main([str(self.repo), '--sessions', str(sessions),
+                                       '--pull-requests', str(snapshot),
+                                       '--output-dir', str(output)])
+        self.assertEqual(status, 0)
+        self.assertEqual(len(list(output.glob('*.jsonl'))), 3)
+        pr_file = next(output.glob('git_pull_requests_*.jsonl'))
+        self.assertEqual(json.loads(pr_file.read_text(encoding='utf-8'))['head_sha'], sha)
+        self.assertEqual(next(output.glob('git_commits_*.jsonl')).read_text(), '')
+        self.assertEqual(next(output.glob('git_session_links_*.jsonl')).read_text(), '')
+
+    def test_utc_timestamp_spellings_compare_as_instants(self):
+        expected = datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc).timestamp()
+        for spelling in ('2026-01-01T10:01:00Z', '2026-01-01T10:01:00+00:00',
+                         '2026-01-01T05:01:00-05:00'):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(extract_git.parse_timestamp(spelling), expected)
+
+
 if __name__ == '__main__':
     unittest.main()
+
