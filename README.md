@@ -119,6 +119,74 @@ extractor in `extract_cursor.py` does not cover)
   - System/user/assistant/tool turns with full content
   - Chat/agent ids, title, mode, created-at, code-context and diff flags
 
+### 10. `extract_hermes.py`
+
+Extracts the default Hermes database and every `profiles/*/state.db` beneath
+`~/.hermes`. Use `--hermes-dir PATH` or `HERMES_HOME` for an alternate root.
+Databases are opened through an encoded SQLite URI with `mode=ro` and copied
+into a consistent in-memory snapshot, including committed WAL rows.
+
+Each record uses the existing `messages` / `source` / `session_id` conversation
+format. The top-level `source` is `hermes`; `metadata.source` preserves the
+session's original channel. Metadata also retains `model`, `profile`,
+`api_call_count`, `input_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+`output_tokens`, `tool_call_count`, session boundaries and parent session ID.
+Unknown counts remain null. Tool calls, tool results and sessions with no
+messages are retained so session usage is preserved. Profile and source-file
+metadata distinguish identical session IDs in different databases.
+Unreadable databases emit stderr warnings and are skipped so other profiles can
+export; this best-effort run can still exit successfully. Check the extraction
+log before treating an export as complete.
+
+### 11. `extract_git.py`
+
+Reads commits reachable from local refs and HEAD in explicitly supplied
+repositories. Each commit includes its SHA, author, committer time, subject,
+changed paths and issue references. It writes separate JSONL tables to
+`extracted_data/git/`:
+
+- `git_commits_TIMESTAMP.jsonl`: commit records.
+- `git_session_links_TIMESTAMP.jsonl`: candidate commit-to-session matches.
+
+The Git extractor requires Python 3.9+ and a local Git executable. Export names
+include microseconds to support immediate repeated runs. Non-UTF-8 filename
+bytes are rendered as literal `\xNN` escapes for privacy-filter compatibility.
+
+A link requires both a bounded session time window and matching repository
+metadata. The extractor uses `git_repo_root`, or a `cwd` / `project_path`
+within the repository. When the session has no end time, its last timestamped
+message supplies the upper bound. Missing paths, missing bounds and invalid
+windows remain unlinked. Hermes' basic sessions table has no path columns;
+optional `cwd` and `git_repo_root` columns are preserved when present.
+
+Matching records retain their source/profile/session identity and evidence;
+overlapping sessions can produce multiple candidates. Git is read locally;
+the extractor does not fetch remote history or query pull-request APIs.
+
+```bash
+python3 extract_hermes.py
+python3 extract_hermes.py --hermes-dir /path/to/hermes --output-dir extracted_data
+
+python3 extract_git.py /path/to/repository \
+  --sessions extracted_data/hermes_conversations_TIMESTAMP.jsonl
+
+# Repository paths are forwarded to Git after conversation extraction.
+./extract_all.sh /path/to/repository /path/to/another-repository
+```
+
+`--sessions` can be repeated and accepts JSONL files or directories.
+`--output-dir` changes the Git table directory. With no repository arguments,
+`extract_all.sh` extracts conversations and skips Git. It excludes previous
+`ALL_CONVERSATIONS_*` files from recombination and keeps Git tables outside
+the conversation corpus. Existing extractor snapshots remain inputs.
+
+The recursive `filter_privacy.py` workflow includes the Git subdirectory, so
+commit metadata and link evidence are filtered along with conversations:
+
+```bash
+python3 filter_privacy.py extracted_data --output-dir filtered_data
+```
+
 ## 🚀 Quick Start
 
 ### Installation
